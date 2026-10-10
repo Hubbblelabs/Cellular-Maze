@@ -2,11 +2,11 @@ import { renderHook, act } from "@testing-library/react";
 import { useNetworkDetect } from "../useNetworkDetect";
 
 describe("useNetworkDetect", () => {
-  let originalNavigator: any;
+  let originalNavigator: Navigator;
 
   beforeEach(() => {
     originalNavigator = global.navigator;
-    // @ts-ignore
+    // @ts-expect-error -- navigator is non-optional in the DOM typings
     delete global.navigator;
     global.navigator = {
       connection: {
@@ -16,7 +16,7 @@ describe("useNetworkDetect", () => {
         addEventListener: jest.fn(),
         removeEventListener: jest.fn(),
       },
-    } as any;
+    } as unknown as Navigator;
 
     global.fetch = jest.fn() as jest.Mock;
   });

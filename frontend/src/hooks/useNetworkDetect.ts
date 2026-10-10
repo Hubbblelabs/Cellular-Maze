@@ -87,11 +87,12 @@ export function useNetworkDetect() {
         // Map ISP name to TelecomMode
         let provider: TelecomMode = "all";
         const ispLower = (data.carrier || data.isp || "").toLowerCase();
-        if (ispLower.includes("jio") || ispLower.includes("reliance")) provider = "jio";
-        else if (ispLower.includes("airtel") || ispLower.includes("bharti")) provider = "airtel";
-        else if (ispLower.includes("vodafone") || ispLower.includes("idea") || ispLower.includes("vi")) provider = "vi";
+        if (/\b(jio|reliance)\b/.test(ispLower)) provider = "jio";
+        else if (/\b(airtel|bharti)\b/.test(ispLower)) provider = "airtel";
+        else if (/\b(vodafone|idea|vi)\b/.test(ispLower)) provider = "vi";
 
-        const displayType = data.carrier || data.isp || "unknown";
+        // A VPN/CDN exit (e.g. Cloudflare WARP) says nothing about the user's SIM
+        const displayType = data.carrier || (data.is_vpn ? "unknown" : data.isp) || "unknown";
 
         setInfo((prev) => ({
           ...prev,

@@ -59,20 +59,20 @@ export function OnboardingTour({ onComplete }: Props) {
     }
   }, []);
 
-  const handleNext = useCallback(() => {
-    if (currentStep < TOUR_STEPS.length - 1) {
-      setCurrentStep((s) => s + 1);
-    } else {
-      handleComplete();
-    }
-  }, [currentStep]);
-
   const handleComplete = useCallback(() => {
     localStorage.setItem("cellularmaze_tour_done", "true");
     localStorage.removeItem("cellularmaze_first_visit");
     setVisible(false);
     onComplete();
   }, [onComplete]);
+
+  const handleNext = useCallback(() => {
+    if (currentStep < TOUR_STEPS.length - 1) {
+      setCurrentStep((s) => s + 1);
+    } else {
+      handleComplete();
+    }
+  }, [currentStep, handleComplete]);
 
   if (!visible) return null;
 

@@ -15,7 +15,7 @@ An ML-powered navigation platform that recommends routes based on **predicted ce
 ```
 User enters source + destination
          |
-   TomTom Routing API generates up to 7 road-snapped alternatives
+   TomTom (live traffic) or OSRM (keyless) generates up to 7 road-snapped alternatives
          |
    Each route path sampled at 500m intervals
          |
@@ -82,6 +82,10 @@ The user adjusts a preference slider (0 = pure speed, 100 = pure signal) and the
 - **Dead zone alerts** -- Toast notifications when approaching weak signal areas across all carriers
 - **Live rerouting** -- Periodic re-evaluation during navigation with automatic reroute if conditions change
 - **Real GPS tracking** -- Live position tracking via browser geolocation API with route progress estimation
+- **Simulated drive** -- When GPS is denied or you are not on the route (e.g. demoing from outside Bengaluru), navigation drives the route in ~90 s so every alert can be seen
+- **Weak-zone countdown** -- During navigation the sidebar counts down to the next weak/no-coverage stretch and warns 1.5 km ahead ("finish calls, cache content now")
+- **Per-carrier comparison** -- Route detail shows average signal for Jio / Airtel / Vi / BSNL on that exact route
+- **Keyless real roads** -- Without a TomTom key, routes come from OSRM (direct + via-zone alternatives), de-duplicated and traffic-adjusted by time of day
 
 ### Signal Intelligence
 - **Multi-SIM scoring** -- Scores every route across all carriers independently, picks best per segment, returns per-carrier breakdown and combined best-of-all score
@@ -102,8 +106,9 @@ The user adjusts a preference slider (0 = pure speed, 100 = pure signal) and the
 ### Map and UX
 - **Mapbox GL JS** -- WebGL-accelerated map with layered route rendering (glow + casing + main line), smooth camera transitions, pitch/bearing 3D support
 - **Real cell tower overlay** -- 601 towers from OpenCelliD rendered at actual coordinates, color-coded by operator
-- **Draggable A/B pins** -- Drag source/destination markers to reroute interactively
-- **Mapbox Search Box** -- Autocomplete with Bangalore viewbox bias for source/destination
+- **Draggable A/B pins** -- Drag source/destination markers to re-run the search from the dropped point
+- **Mapbox Search Box** -- Autocomplete restricted to the Bengaluru metro area for source/destination
+- **Max detour control** -- Cap how much slower than the fastest route a candidate may be (1.25x / 1.5x / 2x / any)
 - **Route detail view** -- Sidebar toggles between route list and selected route detail with signal bars, ETA, distance, and start/stop navigation
 - **Conversational route finder** -- Step-by-step chatbot for route setup (source, destination, network priority, road quality, ISP)
 - **Browser GPS** -- "Use my location" with reverse geocoding to populate source field
@@ -268,7 +273,6 @@ cellular-maze/
 |   |   |   |-- actions/
 |   |   |   |   |-- ActionButtons.tsx   # Locate, track, reroute buttons
 |   |   |   |-- common/
-|   |   |   |   |-- RouteBottomCard.tsx # Route detail card (legacy)
 |   |   |   |   |-- Toast.tsx           # Alert notifications
 |   |   |   |   |-- HeatmapLegend.tsx   # Signal/traffic legend
 |   |   |   |   |-- WeatherBadge.tsx    # Weather condition display
@@ -436,76 +440,74 @@ The ML model (ResidualSignalNet) predicts signal quality at each point:
 | No alternate route | Return single route with signal advisory |
 | GPS drift | watchPosition with enableHighAccuracy for continuous updates |
 | ML service down | Fallback neutral predictions (signal=50, drop=0.1) |
-| OSRM unavailable | Mock route generator with 3 synthetic routes |
+| TomTom key missing | OSRM real-road alternatives (direct + via-zone), traffic-adjusted |
+| OSRM unavailable | Synthetic route generator (offline fallback) |
 
 ## Quick Start
 
-### 1. Backend
+No API keys are required -- without them the app uses OSRM for real road
+routes, the bundled tower snapshot, and neutral weather. A Mapbox public token
+is needed for the map itself.
+
+### 1. Backend + ML model (one process, port 8000)
 
 ```bash
 cd backend
 python -m venv venv
 venv\Scripts\activate          # Windows
 # source venv/bin/activate     # Linux/Mac
-
+pip install torch --index-url https://download.pytorch.org/whl/cpu   # optional: smaller CPU-only torch
 pip install -r requirements.txt
-cp .env.example .env
-
-uvicorn main:app --reload --port 8001
+cd ..
+cp .env.example .env           # optional API keys
+uvicorn backend.main:app --port 8000
 ```
 
-### 2. ML Model Server
+Run `uvicorn` from the **repository root** -- `backend.main` imports the sibling
+`model` package. API docs: http://localhost:8000/docs
 
-```bash
-cd model
-..\.venv\Scripts\python.exe run.py --serve --host 127.0.0.1 --port 8002
-# Linux/Mac: ../venv/bin/python run.py --serve --host 127.0.0.1 --port 8002
-```
-
-### 3. Frontend
+### 2. Frontend (port 3000)
 
 ```bash
 cd frontend
-pnpm install
-pnpm dev
+cp .env.example .env.local     # set NEXT_PUBLIC_MAPBOX_TOKEN
+npm install
+npm run dev
 ```
 
-### 4. Docker (All Services)
+Open http://localhost:3000. Demo login: `demo` / `demo123`.
+
+### 3. Docker (both services)
 
 ```bash
-docker compose up --build
+NEXT_PUBLIC_MAPBOX_TOKEN=pk.xxx docker compose up --build
 ```
 
-- Frontend: http://localhost:3000
-- Backend: http://localhost:8001
-- ML Model: http://localhost:8002
-- API Docs: http://localhost:8001/docs
+`backend/docker-compose.yml` additionally starts MongoDB for persistent profiles.
 
 ## Testing
 
 ```bash
-# Run all 39 backend tests (no external services needed)
-cd <repo-root>
-python -m pytest backend/tests/test_routes.py -v
+# Backend unit tests (no external services needed)
+backend/venv/Scripts/python -m pytest backend/tests -q        # 69 tests
+
+# Model component suite
+backend/venv/Scripts/python test_models.py                    # 73 checks
+
+# Live API integration tests (backend must be running on :8000)
+backend/venv/Scripts/python -m pytest test_integration.py -q
+
+# Frontend
+cd frontend && npm test          # 82 tests
+cd frontend && npm run lint && npx tsc --noEmit && npm run build
 ```
-
-**Test coverage:**
-
-| Module | Tests | What's Tested |
-|--------|-------|---------------|
-| ScoringService | 12 | Signal score, drop prob, ETA normalization, weighted scoring |
-| SignalClient | 3 | ML success, ML failure fallback, cache hits |
-| RLService | 5 | Sampling range, alpha/beta updates, profile creation |
-| RouteService | 5 | Ranking, field validation, RL integration, weight extremes |
-| API | 6 | Health, root, valid route, invalid coords, invalid weight, missing fields |
-| Utilities | 8 | Haversine, point sampling, polyline roundtrip, time encoding |
 
 ## Deployment
 
 | Component | Platform | Config |
 |-----------|----------|--------|
 | Frontend | Vercel | Root: `frontend`, auto-detected Next.js |
-| Backend | Railway / Render | Start: `uvicorn main:app --host 0.0.0.0 --port $PORT` |
+| Backend | Railway / Render | Start (repo root): `uvicorn backend.main:app --host 0.0.0.0 --port $PORT` |
 | Database | MongoDB Atlas | Free M0 tier, set `MONGO_URI` env var |
 
 Full deployment guide: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
@@ -514,14 +516,17 @@ Full deployment guide: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `NEXT_PUBLIC_API_URL` | `http://localhost:8001` | Backend URL for frontend |
+| `NEXT_PUBLIC_API_URL` | `http://localhost:8000` | Backend URL for frontend |
+| `NEXT_PUBLIC_MAPBOX_TOKEN` | _(required for map)_ | Mapbox public token |
+| `SECRET_KEY` | dev-only fallback | JWT signing secret (set in any shared deployment) |
+| `OPENWEATHER_API_KEY` | _(optional)_ | Live weather impact on signal |
 | `MONGO_URI` | `mongodb://localhost:27017` | MongoDB connection string |
 | `DB_NAME` | `cellularmaze` | Database name |
 | `MODEL_URL` | `http://localhost:8002` | ML prediction service |
-| `OSRM_URL` | `http://router.project-osrm.org` | OSRM routing engine (fallback) |
-| `TOMTOM_API_KEY` | _(required)_ | TomTom Routing API key |
+| `OSRM_URL` | `https://router.project-osrm.org` | Keyless road routing used when no TomTom key is set |
+| `TOMTOM_API_KEY` | _(optional)_ | TomTom routing with live traffic (preferred when set) |
 | `TOMTOM_BASE_URL` | `https://api.tomtom.com` | TomTom API base URL |
-| `OPENCELLID_API_KEY` | _(required)_ | OpenCelliD cell tower API key |
+| `OPENCELLID_API_KEY` | _(optional)_ | Live tower lookups along routes (bundled snapshot otherwise) |
 
 ## Real-Time Data Sources
 

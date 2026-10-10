@@ -8,25 +8,39 @@ import { Toast } from "@/src/components/common/Toast";
 import { OnboardingTour } from "@/src/components/common/OnboardingTour";
 import { FilterPanel } from "@/src/components/filters/FilterPanel";
 import { MapContainer, type HeatmapFilterType } from "@/src/components/map/MapContainer";
-import { SearchBar } from "@/src/components/search/SearchBar";
-import { RouteSidebar } from "@/src/components/sidebar/RouteSidebar";
+import { SearchBar, type PlaceSelection } from "@/src/components/search/SearchBar";
+import { RouteSidebar, type NavigationInfo, type OfflineStatus } from "@/src/components/sidebar/RouteSidebar";
 import { useGeolocation } from "@/src/hooks/useGeolocation";
 import { useFastRoutes, useEarlyDeadZones, useHeatmap, useReroute, useRoutes, useTowerMarkers } from "@/src/hooks/useMapData";
 import { useNetworkDetect } from "@/src/hooks/useNetworkDetect";
-import { useTracking } from "@/src/hooks/useTracking";
+import { closestOnPath, cumulativeKm, useTracking } from "@/src/hooks/useTracking";
 import { offlineService, mapboxSearchService, routeService, alertsService } from "@/src/services/api";
-import type { TelecomMode, WeatherInfo, CallDropStats, RouteOption } from "@/src/types/route";
+import type { TelecomMode, CallDropStats, Coordinate, RouteOption } from "@/src/types/route";
+
+/** Sentinel for "highlight whatever the backend recommends" (set by the chatbot). */
+const RECOMMENDED = "__recommended__";
+
+const MAX_DETOUR_OPTIONS: { value: number; label: string }[] = [
+  { value: 1.25, label: "1.25×" },
+  { value: 1.5, label: "1.5×" },
+  { value: 2, label: "2×" },
+  { value: 0, label: "Any" },
+];
+
+/** Warn the driver this far ahead of a weak-signal stretch. */
+const ZONE_WARNING_KM = 1.5;
+
+const toQuery = (c: Coordinate) => `@${c.lat},${c.lng}`;
 
 export default function Home() {
   // Search state -- empty on load
   const [source, setSource] = useState("");
   const [destination, setDestination] = useState("");
-  const [searchTrigger, setSearchTrigger] = useState(0);
   const [hasSearched, setHasSearched] = useState(false);
 
-  // Geocoded coordinate state (set when user selects a Nominatim result)
-  const [sourceCoords, setSourceCoords] = useState<{ lat: number; lng: number } | null>(null);
-  const [destCoords, setDestCoords] = useState<{ lat: number; lng: number } | null>(null);
+  // Geocoded coordinate state (set when user selects an autocomplete result)
+  const [sourceCoords, setSourceCoords] = useState<Coordinate | null>(null);
+  const [destCoords, setDestCoords] = useState<Coordinate | null>(null);
 
   // Filter state
   const [preference, setPreference] = useState(50);
@@ -51,9 +65,8 @@ export default function Home() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [trackingActive, setTrackingActive] = useState(false);
   const [suggestedRoute, setSuggestedRoute] = useState<string>("");
-  const [offlineReady, setOfflineReady] = useState(false);
+  const [offlineStatus, setOfflineStatus] = useState<OfflineStatus>("idle");
   const [alertToast, setAlertToast] = useState<string | null>(null);
-  const [weatherInfo, setWeatherInfo] = useState<WeatherInfo | null>(null);
 
   // Geolocation
   const geo = useGeolocation();
@@ -71,18 +84,18 @@ export default function Home() {
       hasSearched && snapshotSrc && snapshotDst
         ? { source: snapshotSrc, destination: snapshotDst, preference, telecom, max_eta_factor: maxEtaFactor }
         : null,
-    [hasSearched, snapshotSrc, snapshotDst, preference, telecom, maxEtaFactor, searchTrigger],
+    [hasSearched, snapshotSrc, snapshotDst, preference, telecom, maxEtaFactor],
   );
 
   // -----------------------------------------------------------------------
   // Two-phase route loading:
-  //   Phase 1 (fast): TomTom geometry only -- shows routes on map in ~1-2s
+  //   Phase 1 (fast): routing-engine geometry only -- shows routes in ~2s
   //   Phase 2 (full): ML signal scoring, dead zones, weather -- enriches UI
   // -----------------------------------------------------------------------
-  const { data: fastRouteData, isLoading: fastLoading } = useFastRoutes(
+  const { data: fastRouteData, isLoading: fastLoading, isError: fastError } = useFastRoutes(
     snapshotSrc, snapshotDst, hasSearched,
   );
-  const { data: routeData, isLoading: fullLoading } = useRoutes(
+  const { data: routeData, isLoading: fullLoading, isFetching: fullFetching, isError: fullError } = useRoutes(
     queryParams ?? { source: "", destination: "", preference: 50, telecom: "all" },
   );
   const { data: heatmapData } = useHeatmap(heatmapFilter, heatmapFilter !== "none");
@@ -91,20 +104,19 @@ export default function Home() {
 
   // Use full routes if available, otherwise show fast routes (heuristic scoring)
   const hasFull = !!routeData?.routes?.length;
+  const weatherInfo = routeData?.weather ?? null;
 
   // Early dead zone fetch -- starts as soon as the search is triggered (in
-  // parallel with both fast-route and full-ML requests). Dead zone predictions
-  // only need source + destination, not route data. Disabled once full routes
-  // arrive (they embed dead zones directly).
+  // parallel with both fast-route and full-ML requests). Disabled once full
+  // routes arrive (they embed dead zones directly).
   const earlyDzEnabled = hasSearched && !!snapshotSrc && !!snapshotDst && !hasFull;
   const { data: earlyDeadZoneData } = useEarlyDeadZones(snapshotSrc, snapshotDst, earlyDzEnabled);
-  const displayRoutes: RouteOption[] = useMemo(() => {
+  const routes: RouteOption[] = useMemo(() => {
     if (!hasSearched) return [];
     if (hasFull) return routeData.routes;
     // Convert fast routes to RouteOption shape with heuristic scores.
     // When early dead zone data is available, inject it into the matching
-    // route so the map renders dead zone overlays immediately instead of
-    // waiting for the full ML response (saves 15-45 seconds).
+    // route so the map renders dead zone overlays before full ML scoring.
     if (fastRouteData?.routes?.length) {
       const earlyDz = earlyDeadZoneData?.dead_zones;
       const earlyRouteName = earlyDeadZoneData?.route_name;
@@ -116,8 +128,6 @@ export default function Home() {
         signal_score: r.signal_score,
         weighted_score: r.weighted_score,
         zones: r.zones ?? [],
-        // Inject early dead zones into the route that was analyzed
-        // (backend analyzes the first/best route; match by name or index 0)
         ...(earlyDz?.length && (i === 0 || r.name === earlyRouteName)
           ? { carrier_dead_zones: earlyDz }
           : {}),
@@ -126,24 +136,20 @@ export default function Home() {
     return [];
   }, [hasSearched, hasFull, routeData, fastRouteData, earlyDeadZoneData]);
 
-  const routes = displayRoutes;
   const recommendedRoute = (hasFull ? routeData?.recommended_route : fastRouteData?.recommended_route) ?? "";
   const routesLoading = hasSearched && !routes.length && (fastLoading || fullLoading);
+  const routesFailed = hasSearched && !routes.length && fastError && fullError;
 
   // Client-side preference re-ranking: instantly resort displayed routes when
-  // the slider moves, giving immediate visual feedback on the map before the
-  // new backend query resolves. Only applies when we have full ML-scored routes.
+  // the slider moves, before the new backend query resolves. Rejected
+  // ("too slow") routes always sink to the bottom.
   const sortedRoutes = useMemo(() => {
     if (!hasFull || routes.length < 2) return routes;
     const maxEta = Math.max(...routes.map((r) => r.eta), 1);
-    return [...routes].sort((a, b) => {
-      const etaScoreA = ((maxEta - a.eta) / maxEta) * 100;
-      const etaScoreB = ((maxEta - b.eta) / maxEta) * 100;
-      const w = preference / 100;
-      const scoreA = w * a.signal_score + (1 - w) * etaScoreA;
-      const scoreB = w * b.signal_score + (1 - w) * etaScoreB;
-      return scoreB - scoreA;
-    });
+    const w = preference / 100;
+    const score = (r: RouteOption) =>
+      (r.rejected ? -1000 : 0) + w * r.signal_score + (1 - w) * ((maxEta - r.eta) / maxEta) * 100;
+    return [...routes].sort((a, b) => score(b) - score(a));
   }, [routes, preference, hasFull]);
 
   // When preference changes and we have full routes, reset selection to new top route
@@ -159,13 +165,17 @@ export default function Home() {
   const towerMarkers = towerMarkersData ?? [];
 
   const selectedRoute = sortedRoutes[selectedRouteIndex] ?? sortedRoutes[0];
-  const trackingPath = selectedRoute?.path ?? [];
-  const { position: trackingPosition, progress: trackingProgress } = useTracking(trackingPath, trackingActive);
+  const trackingPath = useMemo(() => selectedRoute?.path ?? [], [selectedRoute]);
+  const tracking = useTracking(trackingPath, trackingActive);
+  const trackingPosition = tracking.position;
 
-  const etaDisplay = selectedRoute ? `${selectedRoute.eta} min` : "--";
+  // Latest values for interval callbacks, so timers aren't torn down on every GPS tick
+  const liveRef = useRef({ tracking, selectedRoute, preference, telecom, maxEtaFactor, snapshotDst });
+  useEffect(() => {
+    liveRef.current = { tracking, selectedRoute, preference, telecom, maxEtaFactor, snapshotDst };
+  });
 
-  // Dynamic call drop stats: recomputed whenever selected route changes.
-  // Compares the currently selected route's drop count vs the worst alternative.
+  // Dynamic call drop stats: selected route's drop count vs the worst alternative.
   const callDropStats: CallDropStats | null = useMemo(() => {
     if (!sortedRoutes.length || !hasFull) return null;
     const selDrops = selectedRoute?.segment_drop_count ?? 0;
@@ -183,71 +193,140 @@ export default function Home() {
       message = `${selDrops} weak segment(s) with potential call drop risk`;
     }
     return { drops_avoided: avoided, recommended_drops: selDrops, worst_alternative_drops: worstAlt, message };
-  }, [routes, selectedRouteIndex, selectedRoute, hasFull]);
+  }, [sortedRoutes, selectedRouteIndex, selectedRoute, hasFull]);
+
+  // -----------------------------------------------------------------------
+  // Weak-signal stretches on the selected route, positioned by route distance
+  // -----------------------------------------------------------------------
+  const routeZones = useMemo(() => {
+    if (!selectedRoute || selectedRoute.path.length < 2) return [];
+    const path = selectedRoute.path;
+    const cum = cumulativeKm(path);
+    const zones = [
+      ...(selectedRoute.carrier_dead_zones ?? []).map((z) => ({
+        kind: "dead" as const,
+        label: z.area ? `near ${z.area}` : "Dead zone",
+        start: z.start_coord,
+        lengthKm: z.length_km,
+      })),
+      ...(selectedRoute.bad_zones ?? []).map((z) => ({
+        kind: "weak" as const,
+        label: z.edge_zone_name || (z.area ? `near ${z.area}` : "Weak signal"),
+        start: z.start_coord,
+        lengthKm: z.length_km,
+      })),
+    ];
+    return zones
+      .map((z) => ({ ...z, atKm: cum[closestOnPath(path, z.start).index] }))
+      .sort((a, b) => a.atKm - b.atKm);
+  }, [selectedRoute]);
+
+  const navInfo: NavigationInfo | null = useMemo(() => {
+    if (!trackingActive || !selectedRoute) return null;
+    const traveled = tracking.traveledKm;
+    const next = routeZones.find((z) => z.atKm + z.lengthKm > traveled);
+    const totalKm = selectedRoute.distance;
+    return {
+      mode: tracking.mode,
+      progress: tracking.progress,
+      remainingKm: Math.max(0, totalKm * (1 - tracking.progress)),
+      remainingMin: Math.max(0, selectedRoute.eta * (1 - tracking.progress)),
+      nextZone: next
+        ? {
+            label: next.label,
+            kind: next.kind,
+            lengthKm: next.lengthKm,
+            distanceKm: Math.max(0, next.atKm - traveled),
+            inside: traveled >= next.atKm,
+          }
+        : null,
+    };
+  }, [trackingActive, selectedRoute, tracking, routeZones]);
+
+  const zoneToast = useMemo(() => {
+    const z = navInfo?.nextZone;
+    if (!z) return null;
+    const what = z.kind === "dead" ? "No-coverage zone" : "Weak signal";
+    if (z.inside) return `${what} now (${z.label}) -- connectivity may drop for ~${z.lengthKm.toFixed(1)} km`;
+    if (z.distanceKm <= ZONE_WARNING_KM) {
+      return `${what} in ${z.distanceKm.toFixed(1)} km (${z.label}) -- finish calls and cache content now`;
+    }
+    return null;
+  }, [navInfo]);
+
+  // -----------------------------------------------------------------------
+  // Reroute: ask the backend for a signal-biased route and apply it
+  // -----------------------------------------------------------------------
+  const applyReroute = useCallback(
+    (from: string, bump: number) => {
+      const live = liveRef.current;
+      if (!from || !live.snapshotDst) return;
+      reroute.mutate(
+        {
+          source: from,
+          destination: live.snapshotDst,
+          current_zone: live.selectedRoute?.zones?.[0] ?? "",
+          preference: Math.min(live.preference + bump, 100),
+          telecom: live.telecom,
+        },
+        {
+          onSuccess: (data) => {
+            const name = data.selected_route.name;
+            const idx = sortedRoutes.findIndex((r) => r.name === name);
+            if (from === snapshotSrc && idx >= 0) {
+              setSelectedRouteIndex(idx);
+              setSuggestedRoute(name);
+            } else {
+              // Rerouting from the current position: search again from here
+              setSnapshotSrc(from);
+              setSelectedRouteIndex(0);
+              setSuggestedRoute(RECOMMENDED);
+            }
+          },
+        },
+      );
+    },
+    [reroute, sortedRoutes, snapshotSrc],
+  );
+
+  const handleReroute = useCallback(() => {
+    const pos = liveRef.current.tracking.position;
+    applyReroute(pos ? toQuery(pos) : snapshotSrc, 20);
+  }, [applyReroute, snapshotSrc]);
 
   // -----------------------------------------------------------------------
   // Periodic re-prediction during active navigation
   // -----------------------------------------------------------------------
-  // Re-evaluates the route every ~20% of remaining distance (or every 2 min
-  // minimum).  If an incident/accident changes conditions, the backend returns
-  // a better route which is applied automatically with a toast.
-  const lastRepredictProgress = useRef(0);
-  const repredictTimer = useRef<ReturnType<typeof setInterval> | null>(null);
-
+  // Re-evaluates the route every ~20% of the trip (2 min minimum). If
+  // conditions changed, a better route from the current position is applied.
+  const etaMinutes = selectedRoute?.eta ?? 10;
   useEffect(() => {
-    // Clean up timer when navigation stops
-    if (!trackingActive) {
-      if (repredictTimer.current) {
-        clearInterval(repredictTimer.current);
-        repredictTimer.current = null;
-      }
-      lastRepredictProgress.current = 0;
-      return;
-    }
+    if (!trackingActive) return;
+    let lastProgress = 0;
+    const intervalMs = Math.max(2 * 60_000, etaMinutes * 60_000 * 0.2);
 
-    // Calculate re-prediction interval based on route ETA
-    // Minimum 2 minutes, check every ~20% of total ETA
-    const etaMinutes = selectedRoute?.eta ?? 10;
-    const intervalMs = Math.max(2 * 60_000, (etaMinutes * 60_000 * 0.2));
+    const timer = setInterval(() => {
+      const live = liveRef.current;
+      const { progress, position } = live.tracking;
+      if (progress - lastProgress < 0.15 || progress > 0.9 || !position || !live.snapshotDst) return;
+      lastProgress = progress;
 
-    repredictTimer.current = setInterval(() => {
-      // Only re-predict if we've moved at least 15% since last check
-      const progressDelta = trackingProgress - lastRepredictProgress.current;
-      if (progressDelta < 0.15) return;
-      lastRepredictProgress.current = trackingProgress;
-
-      // Skip if near the end (>90% done)
-      if (trackingProgress > 0.9) return;
-
-      // Get the current position on the path as the new source
-      const currentPos = trackingPosition;
-      if (!currentPos || !destination) return;
-
-      const src = `@${currentPos.lat},${currentPos.lng}`;
-      const dst = destCoords ? `@${destCoords.lat},${destCoords.lng}` : destination;
-
+      const src = toQuery(position);
       routeService
         .getRoutes({
           source: src,
-          destination: dst,
-          preference: Math.min(preference + 10, 100),
-          telecom,
-          max_eta_factor: maxEtaFactor,
+          destination: live.snapshotDst,
+          preference: Math.min(live.preference + 10, 100),
+          telecom: live.telecom,
+          max_eta_factor: live.maxEtaFactor,
         })
         .then((newData) => {
-          if (!newData?.routes?.length) return;
-          const best = newData.routes[0];
-          const current = selectedRoute;
-          // Apply new route if signal score improved by >10 or ETA dropped by >15%
-          if (
-            !current ||
-            best.signal_score > current.signal_score + 10 ||
-            best.eta < current.eta * 0.85
-          ) {
+          const best = newData?.routes?.[0];
+          const current = liveRef.current.selectedRoute;
+          if (!best) return;
+          // Apply if signal improved by >10 or ETA dropped by >15%
+          if (!current || best.signal_score > current.signal_score + 10 || best.eta < current.eta * 0.85) {
             setSnapshotSrc(src);
-            setSnapshotDst(dst);
-            setSearchTrigger((n) => n + 1);
-            setHasSearched(true);
             setSelectedRouteIndex(0);
             setSuggestedRoute(best.name);
           }
@@ -255,36 +334,21 @@ export default function Home() {
         .catch(() => {});
     }, intervalMs);
 
-    return () => {
-      if (repredictTimer.current) {
-        clearInterval(repredictTimer.current);
-        repredictTimer.current = null;
-      }
-    };
-  }, [trackingActive, selectedRoute, trackingProgress, trackingPosition, destination, destCoords, preference, telecom, maxEtaFactor]);
+    return () => clearInterval(timer);
+  }, [trackingActive, etaMinutes]);
 
   // -----------------------------------------------------------------------
-  // Congestion / crowd alert polling during active navigation
+  // Congestion / crowd alert polling during active navigation (every 30 s)
   // -----------------------------------------------------------------------
-  // Polls /api/alerts every 30 s. When a persistent high-congestion event
-  // is detected on the route, a toast is shown and (if flagged) a reroute
-  // is triggered automatically.
-  const alertTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
   useEffect(() => {
-    if (!trackingActive || !trackingPosition) {
-      if (alertTimerRef.current) {
-        clearInterval(alertTimerRef.current);
-        alertTimerRef.current = null;
-      }
-      return;
-    }
+    if (!trackingActive) return;
 
     const checkAlerts = () => {
-      if (!trackingPosition) return;
-      const upcomingPath = selectedRoute?.path ?? [];
+      const live = liveRef.current;
+      const pos = live.tracking.position;
+      if (!pos) return;
       alertsService
-        .getAlerts(trackingPosition.lat, trackingPosition.lng, upcomingPath)
+        .getAlerts(pos.lat, pos.lng, live.selectedRoute?.path ?? [])
         .then((res) => {
           if (res.alerts.length === 0) {
             setAlertToast(null);
@@ -292,63 +356,46 @@ export default function Home() {
           }
           const top = res.alerts[0];
           setAlertToast(top.message);
-          // Auto-trigger reroute for on-route high-severity persistent events
-          if (top.suggest_reroute && top.severity === "high" && !reroute.isPending) {
-            const src = `@${trackingPosition.lat},${trackingPosition.lng}`;
-            const dst = destCoords
-              ? `@${destCoords.lat},${destCoords.lng}`
-              : destination;
-            reroute.mutate({
-              source: src,
-              destination: dst,
-              current_zone: selectedRoute?.zones?.[0] ?? "",
-              preference: Math.min(preference + 20, 100),
-              telecom,
-            });
+          if (top.suggest_reroute && top.severity === "high") {
+            applyReroute(toQuery(pos), 20);
           }
         })
         .catch(() => {});
     };
 
-    checkAlerts();
-    alertTimerRef.current = setInterval(checkAlerts, 30_000);
-
+    const first = setTimeout(checkAlerts, 3_000);
+    const timer = setInterval(checkAlerts, 30_000);
     return () => {
-      if (alertTimerRef.current) {
-        clearInterval(alertTimerRef.current);
-        alertTimerRef.current = null;
-      }
+      clearTimeout(first);
+      clearInterval(timer);
+      setAlertToast(null);
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [trackingActive, trackingPosition, selectedRoute]);
-
-  // Extract weather from route response
-  useEffect(() => {
-    if (routeData?.weather) setWeatherInfo(routeData.weather);
-  }, [routeData]);
-
-  // Offline cache alert: warn user when a dead zone is approaching
-  const offlineAlert = selectedRoute?.offline_alerts?.[0]?.message ?? null;
+  }, [trackingActive, applyReroute]);
 
   // Dead zone warning: prefer per-route data from full response, fall back to
-  // early dead zone fetch (arrives ~5-10s after fast routes, before full ML scoring).
+  // early dead zone fetch (arrives before full ML scoring).
+  const offlineAlert = selectedRoute?.offline_alerts?.[0]?.message ?? null;
   const fullDeadZoneCount = selectedRoute?.carrier_dead_zones?.length ?? 0;
   const earlyDeadZoneCount = (!hasFull && earlyDeadZoneData) ? (earlyDeadZoneData.total_dead_zones ?? 0) : 0;
   const deadZoneCount = fullDeadZoneCount > 0 ? fullDeadZoneCount : earlyDeadZoneCount;
   const deadZoneWarning = deadZoneCount > 0
     ? `${deadZoneCount} dead zone(s) ahead where all carriers are weak`
     : null;
-
-  // Toast priority: offline alert > crowd alert > dead zone > reroute > bad zone
   const badZoneWarning = selectedRoute?.bad_zones?.[0]?.warning ?? null;
-  const toastMessage =
-    offlineAlert ?? alertToast ?? deadZoneWarning ?? reroute.data?.advisory ?? badZoneWarning;
+  const errorMessage = routesFailed
+    ? "Couldn't reach the routing service. Is the backend running?"
+    : null;
+
+  // Toast priority: error > live zone warning > offline > crowd > dead zone > reroute > bad zone
+  const toastMessage = trackingActive
+    ? (zoneToast ?? alertToast ?? reroute.data?.advisory ?? null)
+    : (errorMessage ?? offlineAlert ?? alertToast ?? deadZoneWarning ?? reroute.data?.advisory ?? badZoneWarning);
   const toastType =
-    offlineAlert ? ("warning" as const)
-    : alertToast ? ("warning" as const)
-    : deadZoneWarning ? ("warning" as const)
-    : reroute.data ? ("reroute" as const)
-    : ("info" as const);
+    errorMessage || zoneToast || offlineAlert || alertToast || deadZoneWarning
+      ? ("warning" as const)
+      : reroute.data
+        ? ("reroute" as const)
+        : ("info" as const);
 
   // When geolocation resolves, reverse-geocode GPS coords to a readable name via Mapbox
   useEffect(() => {
@@ -366,112 +413,105 @@ export default function Home() {
     }
   }, [geo.location, source]);
 
-  const handleSearch = useCallback(() => {
-    if (!source || !destination) return;
-    const src = sourceCoords ? `@${sourceCoords.lat},${sourceCoords.lng}` : source;
-    const dst = destCoords ? `@${destCoords.lat},${destCoords.lng}` : destination;
+  const startSearch = useCallback((src: string, dst: string) => {
     setSnapshotSrc(src);
     setSnapshotDst(dst);
-    setSearchTrigger((n) => n + 1);
     setHasSearched(true);
     setSidebarOpen(true);
     setSelectedRouteIndex(0);
     setSuggestedRoute("");
+    setOfflineStatus("idle");
+  }, []);
+
+  const handleSearch = useCallback(
+    (selection?: PlaceSelection) => {
+      // A just-picked place wins over state that may not have re-rendered yet
+      const srcCoords = selection?.field === "source" ? selection : sourceCoords;
+      const dstCoords = selection?.field === "dest" ? selection : destCoords;
+      const srcName = selection?.field === "source" ? selection.name : source;
+      const dstName = selection?.field === "dest" ? selection.name : destination;
+      if (!srcName || !dstName) return;
+      startSearch(srcCoords ? toQuery(srcCoords) : srcName, dstCoords ? toQuery(dstCoords) : dstName);
+    },
+    [source, destination, sourceCoords, destCoords, startSearch],
+  );
+
+  const handleSwap = useCallback(() => {
+    setSource(destination);
+    setDestination(source);
+    setSourceCoords(destCoords);
+    setDestCoords(sourceCoords);
   }, [source, destination, sourceCoords, destCoords]);
 
   const handleRouteSelect = useCallback((index: number) => {
     setSelectedRouteIndex(index);
     setTrackingActive(false);
+    setOfflineStatus("idle");
   }, []);
-
-  const handleReroute = useCallback(() => {
-    if (!source || !destination) return;
-    const currentZone = routes[selectedRouteIndex]?.zones?.[0] ?? source;
-    reroute.mutate({
-      source,
-      destination,
-      current_zone: currentZone,
-      preference: Math.min(preference + 20, 100),
-      telecom,
-    });
-  }, [reroute, source, destination, preference, telecom, routes, selectedRouteIndex]);
 
   const handleStartNavigation = useCallback(() => {
     setTrackingActive(true);
-    // Keep sidebar open -- navigation view is now inside the sidebar
   }, []);
 
   const handleLocateMe = useCallback(() => {
-    if (geo.location) {
-      // Already have location, trigger reverse geocode via the effect
-      setSource("");
-      setTimeout(() => {
-        // Force re-trigger
-        geo.request();
-      }, 50);
-    } else {
-      geo.request();
-    }
+    // Clearing the source lets the geolocation effect fill it in again
+    setSource("");
+    setSourceCoords(null);
+    geo.request();
   }, [geo]);
 
   const handleChatApply = useCallback(
     (chatSource: string, chatDest: string, pref: number, tel: TelecomMode) => {
       setSource(chatSource);
       setDestination(chatDest);
+      setSourceCoords(null);
+      setDestCoords(null);
       setPreference(pref);
       // Map single TelecomMode from chatbot back to selectedIsps
-      if (tel === "all" || tel === "multi") {
-        setSelectedIsps([]);
-      } else {
-        setSelectedIsps([tel]);
-      }
-      setSnapshotSrc(chatSource);
-      setSnapshotDst(chatDest);
-      setSuggestedRoute("Suggested");
-      setHasSearched(true);
-      setSearchTrigger((n) => n + 1);
-      setSidebarOpen(true);
-      setSelectedRouteIndex(0);
+      setSelectedIsps(tel === "all" || tel === "multi" ? [] : [tel]);
+      startSearch(chatSource, chatDest);
+      setSuggestedRoute(RECOMMENDED);
     },
-    [],
+    [startSearch],
   );
 
   const handleDownloadOffline = useCallback(async () => {
-    if (!source || !destination) return;
+    if (!snapshotSrc || !snapshotDst) return;
+    setOfflineStatus("saving");
     try {
-      const bundle = await offlineService.downloadBundle(
-        source, destination, preference, telecom,
-      );
-      offlineService.saveToStorage(bundle);
-      setOfflineReady(true);
+      const bundle = await offlineService.downloadBundle(snapshotSrc, snapshotDst, preference, telecom);
+      offlineService.saveToStorage({ ...bundle, source: source || bundle.source, destination: destination || bundle.destination });
+      setOfflineStatus("saved");
     } catch {
-      // Silently fail -- user can retry
+      setOfflineStatus("error");
     }
-  }, [source, destination, preference, telecom]);
+  }, [snapshotSrc, snapshotDst, preference, telecom, source, destination]);
 
-  // Handle pin drag from map
+  // Dragging an A/B pin re-runs the search from the dropped point
   const handlePinDrag = useCallback(
     (type: "source" | "destination", lat: number, lng: number) => {
+      const coords = { lat, lng };
       if (type === "source") {
-        setSourceCoords({ lat, lng });
-        // Reverse geocode to get name
+        setSourceCoords(coords);
+        setSnapshotSrc(toQuery(coords));
         mapboxSearchService.reverseGeocode(lat, lng).then((name) => {
           if (name) setSource(name);
         }).catch(() => {});
       } else {
-        setDestCoords({ lat, lng });
+        setDestCoords(coords);
+        setSnapshotDst(toQuery(coords));
         mapboxSearchService.reverseGeocode(lat, lng).then((name) => {
           if (name) setDestination(name);
         }).catch(() => {});
       }
-      // Re-trigger route search after short delay
-      setTimeout(() => {
-        setSearchTrigger((n) => n + 1);
-        setHasSearched(true);
-      }, 300);
+      setSelectedRouteIndex(0);
+      setTrackingActive(false);
+      setOfflineStatus("idle");
     },
     [],
   );
+
+  const sidebarSuggested = suggestedRoute === RECOMMENDED ? recommendedRoute : suggestedRoute;
 
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-white">
@@ -501,16 +541,20 @@ export default function Home() {
           setDestCoords(lat !== null && lon !== null ? { lat, lng: lon } : null)
         }
         onSearch={handleSearch}
+        onSwap={handleSwap}
         onUseMyLocation={handleLocateMe}
         geoLoading={geo.loading}
       />
 
-      {/* Signal vs Speed preference slider */}
-      <div className="absolute top-[120px] left-4 z-[1000] w-[360px] glass-card rounded-xl px-3 pt-2.5 pb-3">
+      {/* Signal vs Speed preference slider + detour cap */}
+      <div className="absolute top-[120px] left-4 z-[1000] w-[360px] glass-card rounded-xl px-3 pt-2.5 pb-2.5">
         <div className="flex justify-between items-center mb-2">
           <span className="text-[11px] text-white/45 font-medium">Speed</span>
           <span className="text-[11px] font-semibold text-cyan-400">
             {preference <= 25 ? "Fastest Route" : preference >= 75 ? "Best Signal" : "Balanced"}
+            {hasSearched && hasFull && fullFetching && (
+              <span className="ml-1.5 text-white/35 animate-pulse">updating…</span>
+            )}
           </span>
           <span className="text-[11px] text-white/45 font-medium">Signal</span>
         </div>
@@ -519,18 +563,39 @@ export default function Home() {
           min={0}
           max={100}
           value={preference}
+          aria-label="Speed versus signal preference"
           onChange={(e) => setPreference(Number(e.target.value))}
           className="w-full cursor-pointer accent-cyan-400"
         />
+        <div className="flex items-center gap-1.5 mt-1.5">
+          <span className="text-[10px] text-white/35 mr-auto" title="Routes slower than this multiple of the fastest are marked Too Slow">
+            Max detour vs fastest
+          </span>
+          {MAX_DETOUR_OPTIONS.map((opt) => (
+            <button
+              key={opt.label}
+              type="button"
+              onClick={() => setMaxEtaFactor(opt.value)}
+              className={`px-2 py-0.5 rounded-md text-[10px] font-semibold cursor-pointer transition-colors ${
+                maxEtaFactor === opt.value
+                  ? "bg-cyan-500/20 text-cyan-300 ring-1 ring-cyan-500/40"
+                  : "bg-white/[0.05] text-white/40 hover:text-white/70"
+              }`}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
       </div>
 
-      {/* Enriching indicator */}
-      {/* {hasSearched && !hasFull && fullLoading && routes.length > 0 && (
-        <div className="absolute top-[215px] left-4 z-[900] glass-card rounded-lg px-3 py-2 text-xs text-white/50 flex items-center gap-2 animate-fade-in">
+      {/* Loading indicator while the first routes are computed */}
+      {routesLoading && (
+        <div className="absolute top-[215px] left-4 z-[900] glass-card rounded-lg px-3 py-2 text-xs text-white/60 flex items-center gap-2 animate-fade-in">
           <span className="inline-block h-2 w-2 rounded-full bg-cyan-400 animate-pulse" />
-          Running ML models for precise signal scores...
+          Finding road routes and predicting signal…
         </div>
-      )} */}
+      )}
+
       {/* Filter panel (top-right) */}
       <FilterPanel
         selectedIsps={selectedIsps}
@@ -543,7 +608,7 @@ export default function Home() {
       />
 
       {/* Call-drop stats badge */}
-      {callDropStats && callDropStats.drops_avoided > 0 && (
+      {!trackingActive && callDropStats && callDropStats.drops_avoided > 0 && (
         <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-[1000] glass-card rounded-xl px-4 py-2 text-sm whitespace-nowrap">
           <p className="font-medium text-emerald-400">{callDropStats.message}</p>
         </div>
@@ -554,14 +619,17 @@ export default function Home() {
         routes={sortedRoutes}
         selectedIndex={selectedRouteIndex}
         recommendedRoute={recommendedRoute}
-        suggestedRoute={suggestedRoute ? recommendedRoute : ""}
+        suggestedRoute={sidebarSuggested}
         onSelect={handleRouteSelect}
         onClose={() => setSidebarOpen(false)}
         visible={sidebarOpen && sortedRoutes.length > 0}
         enriching={hasSearched && !hasFull && fullLoading}
         tracking={trackingActive}
+        navigation={navInfo}
         onStartNavigation={handleStartNavigation}
         onStopNavigation={() => setTrackingActive(false)}
+        offlineStatus={offlineStatus}
+        onDownloadOffline={hasFull ? handleDownloadOffline : undefined}
       />
 
       {/* Heatmap color legend (bottom-right) -- only when a layer is active */}
@@ -576,6 +644,7 @@ export default function Home() {
         <ActionButtons
           tracking={trackingActive}
           loading={routesLoading || reroute.isPending}
+          canNavigate={sortedRoutes.length > 0}
           onToggleTracking={() => setTrackingActive((v) => !v)}
           onReroute={handleReroute}
           onLocateMe={handleLocateMe}

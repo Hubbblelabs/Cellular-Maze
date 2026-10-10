@@ -21,15 +21,14 @@ describe("ActionButtons", () => {
 
   it("calls onToggleTracking when tracking button clicked", () => {
     render(<ActionButtons {...defaultProps} />);
-    const buttons = screen.getAllByRole("button");
-    // Tracking button (with Locate icon)
-    const trackBtn = buttons.find(
-      (b) => b.getAttribute("title") === "Start live tracking",
-    );
-    if (trackBtn) {
-      fireEvent.click(trackBtn);
-      expect(defaultProps.onToggleTracking).toHaveBeenCalled();
-    }
+    fireEvent.click(screen.getByRole("button", { name: "Start navigation" }));
+    expect(defaultProps.onToggleTracking).toHaveBeenCalled();
+  });
+
+  it("disables navigation and reroute until a route exists", () => {
+    render(<ActionButtons {...defaultProps} canNavigate={false} />);
+    expect(screen.getByRole("button", { name: "Start navigation" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Smart reroute" })).toBeDisabled();
   });
 
   it("calls onReroute when reroute button clicked", () => {
@@ -41,8 +40,8 @@ describe("ActionButtons", () => {
 
   it("shows active tracking state", () => {
     render(<ActionButtons {...defaultProps} tracking={true} />);
-    const trackBtn = screen.getByTitle("Stop tracking");
-    expect(trackBtn.className).toContain("bg-blue-500");
+    const trackBtn = screen.getByRole("button", { name: "Stop navigation" });
+    expect(trackBtn.className).toContain("from-cyan-500");
   });
 
   it("disables reroute button when loading", () => {

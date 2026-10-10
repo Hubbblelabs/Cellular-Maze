@@ -13,6 +13,8 @@ export type BadZone = {
   time_to_zone_min: number;
   zone_duration_min: number;
   edge_zone_name?: string | null;
+  /** Nearest named area, for display */
+  area?: string;
   warning: string;
 };
 

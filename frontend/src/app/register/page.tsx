@@ -10,11 +10,8 @@ import {
   EyeOff,
   Lock,
   Mail,
-  Signal,
   User,
   TowerControl,
-  Shield,
-  Zap,
   Compass,
   MapPin,
 } from "lucide-react";
@@ -155,7 +152,7 @@ export default function RegisterPage() {
             variants={containerVariants}
             className="grid grid-cols-2 gap-x-8 gap-y-8"
           >
-            {FEATURES.map((feat, i) => (
+            {FEATURES.map((feat) => (
               <motion.div
                 key={feat.title}
                 variants={itemVariants}

@@ -55,6 +55,7 @@ from model.schemas import (
 )
 from backend.routing.tomtom_client import TomTomClient
 from backend.routing.geocode import geocode_query, reverse_geocode_query
+from backend.routing.road_routes import get_road_routes
 from backend.db.base import MongoClient
 from backend import weather as _weather
 from backend import crowd_tracker as _crowd
@@ -66,6 +67,9 @@ try:
     app.include_router(auth_router)
 except ImportError:
     pass  # Auth module not available
+
+from backend.api.health import router as _health_router
+app.include_router(_health_router, prefix="/api/v1", tags=["health"])
 
 # Mount the MongoDB-backed auth router as fallback (requires running MongoDB)
 from backend.api.routes import router as _auth_router
@@ -274,12 +278,12 @@ def _zones_along_path(path: list[dict]) -> list[str]:
     """Identify ZONES that the path passes through."""
     zone_names = []
     seen = set()
-    for pt in path[::max(1, len(path) // 10)]:  # sample ~10 points
+    for pt in path[::max(1, len(path) // 40)]:  # sample ~40 points
         for name, info in ZONES.items():
             if name in seen:
                 continue
             c = info["center"]
-            if haversine(pt["lat"], pt["lng"], c[0], c[1]) < 3.0:  # within 3 km
+            if haversine(pt["lat"], pt["lng"], c[0], c[1]) < info["radius_km"] + 0.3:
                 zone_names.append(name)
                 seen.add(name)
     return zone_names
@@ -386,6 +390,71 @@ def _generate_routes_sync(
     return routes
 
 
+def _via_candidates(
+    src: tuple[float, float], dst: tuple[float, float], limit: int = 5,
+) -> list[tuple[str, tuple[float, float]]]:
+    """Zone centres that make sensible detours between src and dst."""
+    total = haversine(src[0], src[1], dst[0], dst[1])
+    if total < 3.0:
+        return []
+    scored = []
+    for name, info in ZONES.items():
+        c = info["center"]
+        d_src = haversine(src[0], src[1], c[0], c[1])
+        d_dst = haversine(dst[0], dst[1], c[0], c[1])
+        ratio = (d_src + d_dst) / total
+        if d_src > 1.5 and d_dst > 1.5 and ratio < 1.45:
+            scored.append((ratio, name, c))
+    scored.sort()
+    return [(name, c) for _, name, c in scored[:limit]]
+
+
+async def _fetch_base_routes(
+    src: tuple[float, float], dst: tuple[float, float],
+) -> list[dict]:
+    """Route geometry from the best available engine, without towers or ML.
+
+    Fallback chain: TomTom (live traffic, needs API key) -> OSRM (real
+    roads, keyless) -> synthetic straight-line paths (offline).
+    """
+    if _tomtom._api_key:
+        tt_routes = await _tomtom.get_routes(src, dst, mock_fallback=False)
+        if tt_routes and tt_routes[0].get("geometry"):
+            total_dist = haversine(src[0], src[1], dst[0], dst[1])
+            routes = []
+            for i, tt in enumerate(tt_routes[:_MAX_ROUTES]):
+                path = tt["geometry"]
+                dist_km = 0.0
+                for j in range(len(path) - 1):
+                    dist_km += haversine(
+                        path[j]["lat"], path[j]["lng"],
+                        path[j + 1]["lat"], path[j + 1]["lng"],
+                    )
+                dist_km = dist_km if dist_km > 0 else total_dist
+                name = _ROUTE_NAMES[i] if i < len(_ROUTE_NAMES) else f"Route {i + 1}"
+                routes.append({
+                    "name": name,
+                    "eta": tt["eta"],
+                    "distance": round(dist_km, 1),
+                    "path": path,
+                    "zones": _zones_along_path(path),
+                    "traffic_delay": tt.get("traffic_delay", 0),
+                    "source": "tomtom",
+                })
+            return routes
+
+    road = await get_road_routes(src, dst, _via_candidates(src, dst), max_routes=_MAX_ROUTES)
+    if road:
+        for r in road:
+            r["zones"] = _zones_along_path(r["path"])
+        return road
+
+    synthetic = _generate_routes_sync(src, dst)[:_MAX_ROUTES]
+    for r in synthetic:
+        r["source"] = "synthetic"
+    return synthetic
+
+
 _ROUTE_NAMES = [
     "Fastest Route",
     "Balanced Route",
@@ -447,51 +516,7 @@ async def _generate_routes(
                 return _copy.deepcopy(cached_routes)
 
         # -- actual route generation --
-        if not _tomtom._api_key:
-            routes = _generate_routes_sync(src, dst)
-        else:
-            try:
-                tt_routes = await _tomtom.get_routes(src, dst)
-            except Exception:
-                routes = _generate_routes_sync(src, dst)
-            else:
-                if not tt_routes or not tt_routes[0].get("geometry"):
-                    routes = _generate_routes_sync(src, dst)
-                else:
-                    total_dist = haversine(src[0], src[1], dst[0], dst[1])
-                    routes = []
-                    for i, tt in enumerate(tt_routes):
-                        path = tt["geometry"]
-                        dist_km = 0.0
-                        for j in range(len(path) - 1):
-                            dist_km += haversine(
-                                path[j]["lat"], path[j]["lng"],
-                                path[j + 1]["lat"], path[j + 1]["lng"],
-                            )
-                        dist_km = dist_km if dist_km > 0 else total_dist
-                        name = _ROUTE_NAMES[i] if i < len(_ROUTE_NAMES) else f"Route {i + 1}"
-                        zones = _zones_along_path(path)
-                        routes.append({
-                            "name": name,
-                            "eta": tt["eta"],
-                            "distance": round(dist_km, 1),
-                            "path": path,
-                            "zones": zones,
-                            "traffic_delay": tt.get("traffic_delay", 0),
-                        })
-                    # Cap at _MAX_ROUTES
-                    routes = routes[:_MAX_ROUTES]
-
-                    # If TomTom returned fewer than 5 routes, pad with synthetic
-                    # alternatives so the map always shows visually distinct paths.
-                    if len(routes) < 5:
-                        synthetic = _generate_routes_sync(src, dst)
-                        existing_names = {r["name"] for r in routes}
-                        for syn in synthetic:
-                            if len(routes) >= 5:
-                                break
-                            if syn["name"] not in existing_names:
-                                routes.append(syn)
+        routes = await _fetch_base_routes(src, dst)
 
         # Fetch real cell towers along each route from OpenCelliD (parallel via executor)
         loop = asyncio.get_event_loop()
@@ -581,7 +606,7 @@ async def api_routes_fast(
 ):
     """Return route geometry FAST with heuristic scoring.
 
-    Runs TomTom routing only (no tower lookup, no ML inference).
+    Runs the routing engine only (no tower lookup, no ML inference).
     Estimates signal quality from zone density/terrain metadata for
     instant display.  The frontend upgrades to full ML scores once
     ``/api/routes`` completes in the background.
@@ -590,48 +615,11 @@ async def api_routes_fast(
         _resolve_location(source), _resolve_location(destination)
     )
 
-    # TomTom routing only (no tower fetching, no ML)
-    if _tomtom._api_key:
-        try:
-            tt_routes = await _tomtom.get_routes(src, dst)
-        except Exception:
-            tt_routes = None
-    else:
-        tt_routes = None
-
-    if tt_routes and tt_routes[0].get("geometry"):
-        total_dist = haversine(src[0], src[1], dst[0], dst[1])
-        routes = []
-        for i, tt in enumerate(tt_routes[:_MAX_ROUTES]):
-            path = tt["geometry"]
-            dist_km = 0.0
-            for j in range(len(path) - 1):
-                dist_km += haversine(
-                    path[j]["lat"], path[j]["lng"],
-                    path[j + 1]["lat"], path[j + 1]["lng"],
-                )
-            dist_km = dist_km if dist_km > 0 else total_dist
-            name = _ROUTE_NAMES[i] if i < len(_ROUTE_NAMES) else f"Route {i + 1}"
-            zones = _zones_along_path(path)
-            routes.append({
-                "name": name,
-                "eta": tt["eta"],
-                "distance": round(dist_km, 1),
-                "path": path,
-                "zones": zones,
-                "traffic_delay": tt.get("traffic_delay", 0),
-            })
-    else:
-        # Synthetic fallback -- still fast, no towers needed
-        syn = _generate_routes_sync(src, dst)
-        routes = [
-            {
-                "name": r["name"], "eta": r["eta"],
-                "distance": r["distance"], "path": r["path"],
-                "zones": r.get("zones", []),
-            }
-            for r in syn[:_MAX_ROUTES]
-        ]
+    # Routing engine only (no tower fetching, no ML)
+    routes = [
+        {k: r[k] for k in ("name", "eta", "distance", "path", "zones", "traffic_delay", "source") if k in r}
+        for r in await _fetch_base_routes(src, dst)
+    ]
 
     # ------------------------------------------------------------------
     # Heuristic signal scoring (no ML, no towers -- instant)
@@ -769,12 +757,15 @@ async def api_routes(
     results = []
     for r, cz in zip(ranked, carrier_results):
         conn = r.get("connectivity", {})
+        # Route's own average speed (traffic-adjusted) for "time to zone" estimates
+        route_speed = r["distance"] / (r["eta"] / 60.0) if r.get("eta") else 40.0
+        route_speed = min(max(route_speed, 8.0), 90.0)
 
         # Detect bad zones along this route
         bad_zones = detect_bad_zones(
             r["path"],
             conn.get("segment_signals", []),
-            avg_speed_kmh=40.0,
+            avg_speed_kmh=route_speed,
         )
 
         entry = {
@@ -809,6 +800,7 @@ async def api_routes(
                     "time_to_zone_min": bz["time_to_zone_min"],
                     "zone_duration_min": bz["zone_duration_min"],
                     "edge_zone_name": bz.get("edge_zone_name"),
+                    "area": _dzp._nearest_zone_name(bz["start_coord"]["lat"], bz["start_coord"]["lng"]),
                     "warning": bz["warning"],
                 }
                 for bz in bad_zones
@@ -828,7 +820,7 @@ async def api_routes(
         entry["offline_alerts"] = _dzp.offline_cache_alerts(
             r["path"],
             conn.get("segment_signals", []),
-            speed_kmh=40.0,
+            speed_kmh=route_speed,
         )
 
         results.append(entry)
@@ -1742,4 +1734,4 @@ async def api_offline_bundle(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8001")))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))

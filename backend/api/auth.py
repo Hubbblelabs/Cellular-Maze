@@ -4,30 +4,34 @@ Provides JWT-based auth with mock user storage for hackathon demo.
 In production, this would integrate with MongoDB via Motor.
 """
 
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel, EmailStr
+from passlib.context import CryptContext
+from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/api/v1", tags=["Authentication"])
 
-# JWT Configuration
-SECRET_KEY = "cellularmaze-hackathon-secret-key-2026"
+# JWT Configuration -- set SECRET_KEY in production; the fallback is for local dev only
+SECRET_KEY = os.environ.get("SECRET_KEY") or "cellularmaze-dev-only-secret"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440  # 24 hours
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/login")
 
+_pwd = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+
 
 # ── Schemas ──────────────────────────────────────────────────────────────
 
 class UserRegister(BaseModel):
-    username: str
-    password: str
-    email: str
+    username: str = Field(min_length=3, max_length=32, pattern=r"^[a-zA-Z0-9_.\-]+$")
+    password: str = Field(min_length=6, max_length=128)
+    email: str = Field(max_length=254, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 class TokenResponse(BaseModel):
@@ -50,7 +54,7 @@ _users: dict[str, dict] = {
     "demo": {
         "user_id": "usr_demo",
         "username": "demo",
-        "password": "demo123",
+        "password_hash": _pwd.hash("demo123"),
         "email": "demo@cellularmaze.ai",
         "created_at": "2026-01-01T00:00:00Z",
     }
@@ -83,7 +87,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     Accepts application/x-www-form-urlencoded with username and password fields.
     """
     user = _users.get(form_data.username)
-    if not user or user["password"] != form_data.password:
+    if not user or not _pwd.verify(form_data.password, user["password_hash"]):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid username or password",
@@ -115,7 +119,7 @@ async def register(req: UserRegister):
     _users[req.username] = {
         "user_id": user_id,
         "username": req.username,
-        "password": req.password,
+        "password_hash": _pwd.hash(req.password),
         "email": req.email,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }

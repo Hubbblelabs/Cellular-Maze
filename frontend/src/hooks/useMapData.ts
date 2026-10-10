@@ -2,7 +2,8 @@
 
 import { useMutation, useQuery } from "@tanstack/react-query";
 
-import { deadZoneService, heatmapService, predictionService, routeService, towerService, towerGeoService } from "@/src/services/api";import type { RerouteRequest, RouteQueryParams } from "@/src/types/route";
+import { deadZoneService, heatmapService, predictionService, routeService, towerService, towerGeoService } from "@/src/services/api";
+import type { RerouteRequest, RouteQueryParams } from "@/src/types/route";
 
 /**
  * Fast route fetch -- geometry only, no ML scoring.
@@ -29,6 +30,14 @@ export function useRoutes(params: RouteQueryParams) {
     enabled: !!params.source && !!params.destination,
     staleTime: 30_000,
     retry: 1,
+    // Keep showing the ML-scored routes while a slider/carrier change refetches,
+    // but never carry results over to a different origin/destination.
+    placeholderData: (prev, prevQuery) => {
+      const prevParams = prevQuery?.queryKey[1] as RouteQueryParams | undefined;
+      return prevParams?.source === params.source && prevParams?.destination === params.destination
+        ? prev
+        : undefined;
+    },
   });
 }
 

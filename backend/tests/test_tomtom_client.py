@@ -132,7 +132,7 @@ class TestSuccessfulResponse:
 
         assert "12.9716,77.5946:12.8399,77.667" in url
         assert params["key"] == "test-key"
-        assert params["maxAlternatives"] == "2"
+        assert params["maxAlternatives"] == "5"
         assert params["traffic"] == "true"
 
 
@@ -154,8 +154,8 @@ class TestFallbackOnFailure:
 
         routes = await client.get_routes(ORIGIN, DESTINATION)
 
-        # Fallback returns 2 mock routes
-        assert len(routes) == 2
+        # Fallback returns 7 mock routes
+        assert len(routes) == 7
         for r in routes:
             assert "eta" in r
             assert "geometry" in r
@@ -173,7 +173,7 @@ class TestFallbackOnFailure:
         client._client = mock_http
 
         routes = await client.get_routes(ORIGIN, DESTINATION)
-        assert len(routes) == 2
+        assert len(routes) == 7
 
     @pytest.mark.asyncio
     async def test_retries_once_before_fallback(self, client: TomTomClient):
@@ -220,7 +220,7 @@ class TestFallbackOnFailure:
         client._client = mock_http
 
         routes = await client.get_routes(ORIGIN, DESTINATION)
-        assert len(routes) == 2  # fallback
+        assert len(routes) == 7  # fallback
 
 
 # -----------------------------------------------------------------------
@@ -330,9 +330,9 @@ class TestMultipleRoutes:
 
 
 class TestMockFallback:
-    def test_generates_two_routes(self):
+    def test_generates_seven_routes(self):
         routes = _generate_mock_routes(ORIGIN, DESTINATION)
-        assert len(routes) == 2
+        assert len(routes) == 7
 
     def test_geometry_starts_and_ends_correctly(self):
         routes = _generate_mock_routes(ORIGIN, DESTINATION)

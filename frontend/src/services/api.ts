@@ -14,11 +14,10 @@ import type {
   TowerMarker,
   TowerMarkersResponse,
   WeatherInfo,
-  CarrierSignalSummary,
   CarrierDeadZone,
 } from "@/src/types/route";
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 const client = axios.create({
   baseURL: API_BASE_URL,
@@ -125,9 +124,21 @@ export const offlineService = {
 
 const MAPBOX_TOKEN = process.env.NEXT_PUBLIC_MAPBOX_TOKEN ?? "";
 
+// crypto.randomUUID only exists in secure contexts (https/localhost); opening
+// the dev server from a phone over http://<LAN-IP> must not crash the app.
+function newSessionToken(): string {
+  return typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
 // One session token per search session; reset after retrieve() per Mapbox spec.
-let _mbxSessionToken: string =
-  typeof crypto !== "undefined" ? crypto.randomUUID() : Math.random().toString(36).slice(2);
+let _mbxSessionToken: string = newSessionToken();
+
+// Coverage data, towers and the ML model are calibrated for Bengaluru, so
+// autocomplete is restricted to the metro area (incl. the airport).
+const BENGALURU_CENTER = { lat: 12.9716, lng: 77.5946 };
+const BENGALURU_BBOX = "77.35,12.70,77.85,13.25";
 
 export type MapboxSuggestion = {
   name: string;         // short place name, e.g. "Koramangala"
@@ -149,8 +160,10 @@ export const mapboxSearchService = {
       country: "in",
       language: "en",
       limit: "5",
+      bbox: BENGALURU_BBOX,
     });
-    if (proximity) params.set("proximity", `${proximity.lng},${proximity.lat}`);
+    const bias = proximity ?? BENGALURU_CENTER;
+    params.set("proximity", `${bias.lng},${bias.lat}`);
     try {
       const resp = await fetch(
         `https://api.mapbox.com/search/searchbox/v1/suggest?${params}`,
@@ -194,8 +207,7 @@ export const mapboxSearchService = {
         }>;
       };
       // Reset session token after a successful retrieve (Mapbox billing spec)
-      _mbxSessionToken =
-        typeof crypto !== "undefined" ? crypto.randomUUID() : Math.random().toString(36).slice(2);
+      _mbxSessionToken = newSessionToken();
       const feature = data.features?.[0];
       if (!feature) return null;
       const [lng, lat] = feature.geometry.coordinates;

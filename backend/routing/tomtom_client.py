@@ -206,6 +206,7 @@ class TomTomClient:
         self,
         origin: tuple[float, float],
         destination: tuple[float, float],
+        mock_fallback: bool = True,
     ) -> list[dict]:
         """Fetch routes from TomTom.
 
@@ -213,7 +214,9 @@ class TomTomClient:
 
             [{"eta": float, "geometry": [...], "traffic_delay": float}, ...]
 
-        On failure (after one retry), returns mock fallback routes.
+        On failure (after one retry), returns mock fallback routes, or an
+        empty list when ``mock_fallback`` is False so callers can try other
+        routing engines first.
         """
         try:
             parsed = await self._fetch_with_retry(origin, destination)
@@ -221,6 +224,9 @@ class TomTomClient:
                 return [self._route_to_dict(r) for r in parsed]
         except Exception:
             logger.exception("TomTom routing failed after retry")
+
+        if not mock_fallback:
+            return []
 
         logger.warning(
             "TomTom API unavailable -- returning mock fallback routes"

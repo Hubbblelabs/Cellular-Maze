@@ -1,7 +1,8 @@
 """Comprehensive model component tests -- run one by one."""
 import sys, os, traceback
-sys.path.insert(0, "D:/Github/MAHE-Hackathon")
-os.chdir("D:/Github/MAHE-Hackathon")
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _ROOT)
+os.chdir(_ROOT)
 
 import numpy as np
 import pandas as pd

@@ -103,12 +103,14 @@ type Props = {
 };
 
 export function ChatBot({ onClose, onApply, detectedNetwork }: Props) {
-  const steps = useRef(buildSteps(detectedNetwork)).current;
+  // Steps are fixed for the lifetime of a conversation
+  const [steps] = useState(() => buildSteps(detectedNetwork));
   const [messages, setMessages] = useState<Message[]>([]);
   const [stepIndex, setStepIndex] = useState(0);
   const [answers, setAnswers] = useState<Partial<ChatAnswers>>({});
   const [inputValue, setInputValue] = useState("");
-  const [isTyping, setIsTyping] = useState(false);
+  // Starts "typing" while the greeting is on its way
+  const [isTyping, setIsTyping] = useState(true);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -118,7 +120,6 @@ export function ChatBot({ onClose, onApply, detectedNetwork }: Props) {
   }, [messages, isTyping]);
 
   useEffect(() => {
-    setIsTyping(true);
     const t = setTimeout(() => {
       setMessages([
         {

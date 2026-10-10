@@ -1,8 +1,34 @@
 ﻿"use client";
 
 import { useState } from "react";
-import { AlertTriangle, ArrowLeft, ChevronLeft, Clock, MapPin, Navigation, Shield, Square, Wifi } from "lucide-react";
+import {
+  AlertTriangle, ArrowLeft, Check, ChevronLeft, Clock, Download, Loader2, MapPin, Navigation, Shield,
+  SignalZero, Square, Wifi,
+} from "lucide-react";
 import type { RouteOption } from "@/src/types/route";
+
+export type OfflineStatus = "idle" | "saving" | "saved" | "error";
+
+export type NavigationInfo = {
+  mode: "gps" | "simulated" | null;
+  progress: number;
+  remainingKm: number;
+  remainingMin: number;
+  nextZone: {
+    label: string;
+    kind: "dead" | "weak";
+    lengthKm: number;
+    distanceKm: number;
+    inside: boolean;
+  } | null;
+};
+
+const CARRIER_COLORS: Record<string, string> = {
+  Jio: "#3b82f6",
+  Airtel: "#ef4444",
+  Vi: "#8b5cf6",
+  BSNL: "#eab308",
+};
 
 type Props = {
   routes: RouteOption[];
@@ -16,6 +42,9 @@ type Props = {
   onClose: () => void;
   visible: boolean;
   enriching?: boolean;
+  navigation?: NavigationInfo | null;
+  offlineStatus?: OfflineStatus;
+  onDownloadOffline?: () => void;
 };
 
 function signalInfo(score: number) {
@@ -66,6 +95,9 @@ export function RouteSidebar({
   tracking,
   onStartNavigation,
   onStopNavigation,
+  navigation,
+  offlineStatus = "idle",
+  onDownloadOffline,
 }: Props) {
   // "detail" view: shows selected route info with start/back buttons
   // "list" view: shows all routes
@@ -79,6 +111,13 @@ export function RouteSidebar({
 
   // When tracking is active, always show the detail/navigation view
   const showDetail = tracking || view === "detail";
+
+  // Data-driven badges so names like "Via Koramangala" are easy to compare
+  const active = routes.filter((r) => !r.rejected);
+  const fastestName = active.length ? active.reduce((a, b) => (b.eta < a.eta ? b : a)).name : "";
+  const bestSignalName = active.length ? active.reduce((a, b) => (b.signal_score > a.signal_score ? b : a)).name : "";
+  const carriers = Object.entries(selectedRoute.carrier_summary ?? {}).sort((a, b) => b[1].avg - a[1].avg);
+  const nav = tracking ? navigation : null;
 
   return (
     <div className="absolute top-[207px] left-3 z-[800] max-h-[calc(100vh-217px)] w-[360px] glass-card flex flex-col rounded-2xl overflow-hidden animate-slide-in-left">
@@ -159,6 +198,137 @@ export function RouteSidebar({
                 <span className="text-[10px] text-white/35">km</span>
               </div>
             </div>
+
+            {nav && (
+              <div className="mb-4 space-y-2.5">
+                <div>
+                  <div className="flex items-center justify-between text-[10px] text-white/40 mb-1">
+                    <span>
+                      {Math.round(nav.remainingMin)} min · {nav.remainingKm.toFixed(1)} km left
+                    </span>
+                    {nav.mode === "simulated" && (
+                      <span
+                        className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 font-semibold"
+                        title="GPS is unavailable or you are not on this route, so the drive is simulated"
+                      >
+                        Simulated drive
+                      </span>
+                    )}
+                    {nav.mode === "gps" && <span className="text-emerald-400 font-semibold">Live GPS</span>}
+                    {nav.mode === null && <span className="animate-pulse">Locating…</span>}
+                  </div>
+                  <div className="h-1.5 rounded-full bg-white/10 overflow-hidden">
+                    <div
+                      className="h-full bg-gradient-to-r from-cyan-500 to-blue-500 transition-[width] duration-500"
+                      style={{ width: `${Math.round(nav.progress * 100)}%` }}
+                    />
+                  </div>
+                </div>
+
+                {nav.nextZone ? (
+                  <div
+                    className={`flex items-start gap-2.5 rounded-xl px-3 py-2.5 border ${
+                      nav.nextZone.inside || nav.nextZone.distanceKm <= 1.5
+                        ? "bg-red-500/10 border-red-500/30"
+                        : "bg-amber-500/[0.07] border-amber-500/20"
+                    }`}
+                  >
+                    <SignalZero
+                      size={16}
+                      className={`shrink-0 mt-0.5 ${
+                        nav.nextZone.inside || nav.nextZone.distanceKm <= 1.5 ? "text-red-400" : "text-amber-400"
+                      }`}
+                    />
+                    <div className="min-w-0">
+                      <p className="text-[12px] font-semibold text-white/90">
+                        {nav.nextZone.inside
+                          ? "In weak-signal zone"
+                          : `${nav.nextZone.kind === "dead" ? "No-coverage zone" : "Weak signal"} in ${nav.nextZone.distanceKm.toFixed(1)} km`}
+                      </p>
+                      <p className="text-[10px] text-white/45 truncate">
+                        {nav.nextZone.label} · ~{nav.nextZone.lengthKm.toFixed(1)} km long
+                      </p>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2 rounded-xl px-3 py-2.5 bg-emerald-500/[0.07] border border-emerald-500/20 text-[12px] text-emerald-300">
+                    <Wifi size={14} /> Good coverage for the rest of the trip
+                  </div>
+                )}
+              </div>
+            )}
+
+            {!tracking && (
+              <div className="mb-4 space-y-3">
+                {/* Reliability summary */}
+                <div className="grid grid-cols-3 gap-1.5 text-center">
+                  <div className="bg-slate-800/60 rounded-lg py-2">
+                    <p className="text-[13px] font-bold" style={{ color: sig.color }}>
+                      {Math.round(selectedRoute.signal_score)}
+                    </p>
+                    <p className="text-[9px] text-white/35">signal</p>
+                  </div>
+                  <div className="bg-slate-800/60 rounded-lg py-2">
+                    <p className="text-[13px] font-bold text-white/85">
+                      {selectedRoute.stability_score !== undefined ? Math.round(selectedRoute.stability_score) : "--"}
+                    </p>
+                    <p className="text-[9px] text-white/35">stability</p>
+                  </div>
+                  <div className="bg-slate-800/60 rounded-lg py-2">
+                    <p className="text-[13px] font-bold text-white/85">
+                      {(selectedRoute.bad_zones?.length ?? 0) + (selectedRoute.carrier_dead_zones?.length ?? 0)}
+                    </p>
+                    <p className="text-[9px] text-white/35">weak zones</p>
+                  </div>
+                </div>
+
+                {/* Per-carrier comparison: which SIM works best on this route */}
+                {carriers.length > 0 && (
+                  <div>
+                    <p className="text-[10px] font-semibold uppercase tracking-wider text-white/35 mb-1.5">
+                      Signal by carrier on this route
+                    </p>
+                    <div className="space-y-1">
+                      {carriers.map(([name, c], i) => (
+                        <div key={name} className="flex items-center gap-2 text-[11px]">
+                          <span className="w-11 text-white/60">{name}</span>
+                          <div className="flex-1 h-1.5 rounded-full bg-white/10 overflow-hidden">
+                            <div
+                              className="h-full rounded-full"
+                              style={{ width: `${Math.min(100, c.avg)}%`, background: CARRIER_COLORS[name] ?? "#94a3b8" }}
+                            />
+                          </div>
+                          <span className="w-7 text-right text-white/70 tabular-nums">{Math.round(c.avg)}</span>
+                          <span className={`w-6 text-[9px] font-semibold ${i === 0 ? "text-emerald-400" : "text-transparent"}`}>
+                            best
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {onDownloadOffline && (
+                  <button
+                    type="button"
+                    onClick={onDownloadOffline}
+                    disabled={offlineStatus === "saving"}
+                    className="w-full flex items-center justify-center gap-2 py-2 rounded-lg text-[12px] font-medium cursor-pointer transition-colors bg-white/[0.05] hover:bg-white/[0.1] text-white/70 disabled:opacity-60"
+                  >
+                    {offlineStatus === "saving" && <Loader2 size={13} className="animate-spin" />}
+                    {offlineStatus === "saved" && <Check size={13} className="text-emerald-400" />}
+                    {(offlineStatus === "idle" || offlineStatus === "error") && <Download size={13} />}
+                    {offlineStatus === "saving"
+                      ? "Saving route for offline use…"
+                      : offlineStatus === "saved"
+                        ? "Saved for offline use"
+                        : offlineStatus === "error"
+                          ? "Save failed -- retry"
+                          : "Save route for offline use"}
+                  </button>
+                )}
+              </div>
+            )}
 
             {/* Start / Stop button */}
             {tracking ? (
@@ -250,6 +420,19 @@ export function RouteSidebar({
                   </span>
                 )}
               </div>
+              {!isRejected && (route.name === recommendedRoute || route.name === fastestName || route.name === bestSignalName) && (
+                <div className="flex flex-wrap gap-1 mb-1 ml-[22px]">
+                  {route.name === recommendedRoute && (
+                    <span className="text-[9px] font-semibold bg-cyan-500/15 text-cyan-300 px-1.5 py-0.5 rounded">Recommended</span>
+                  )}
+                  {route.name === fastestName && (
+                    <span className="text-[9px] font-semibold bg-blue-500/15 text-blue-300 px-1.5 py-0.5 rounded">Fastest</span>
+                  )}
+                  {route.name === bestSignalName && (
+                    <span className="text-[9px] font-semibold bg-emerald-500/15 text-emerald-300 px-1.5 py-0.5 rounded">Best signal</span>
+                  )}
+                </div>
+              )}
 
               {/* Stats row */}
               <div className="flex items-center gap-2 mt-2">

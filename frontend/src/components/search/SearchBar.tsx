@@ -1,9 +1,18 @@
 ﻿"use client";
 
 import { ArrowUpDown, Loader2, MapPin, Search, X } from "lucide-react";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useRef, useState, type KeyboardEvent } from "react";
 
 import { mapboxSearchService, type MapboxSuggestion } from "@/src/services/api";
+
+/** A place the user just picked from autocomplete, passed straight to the
+ * search so it doesn't depend on parent state that hasn't re-rendered yet. */
+export type PlaceSelection = {
+  field: "source" | "dest";
+  name: string;
+  lat: number;
+  lng: number;
+};
 
 type Props = {
   source: string;
@@ -12,7 +21,8 @@ type Props = {
   onDestinationChange: (v: string) => void;
   onSourceCoords?: (lat: number | null, lon: number | null) => void;
   onDestCoords?: (lat: number | null, lon: number | null) => void;
-  onSearch: () => void;
+  onSearch: (selection?: PlaceSelection) => void;
+  onSwap?: () => void;
   onUseMyLocation?: () => void;
   geoLoading?: boolean;
 };
@@ -38,6 +48,7 @@ export function SearchBar({
   onSourceCoords,
   onDestCoords,
   onSearch,
+  onSwap,
   onUseMyLocation,
   geoLoading,
 }: Props) {
@@ -98,29 +109,50 @@ export function SearchBar({
       const result = await mapboxSearchService.retrieve(sug.mapbox_id);
       setIsRetrieving(false);
 
-      if (result) {
+      if (result && focusedField) {
+        const name = result.name || label;
         if (focusedField === "source") {
-          onSourceChange(result.name || label);
+          onSourceChange(name);
           onSourceCoords?.(result.lat, result.lng);
         } else {
-          onDestinationChange(result.name || label);
+          onDestinationChange(name);
           onDestCoords?.(result.lat, result.lng);
         }
         const other = focusedField === "source" ? destination : source;
-        if (other) setTimeout(onSearch, 100);
+        if (other) onSearch({ field: focusedField, name, lat: result.lat, lng: result.lng });
       }
     },
     [focusedField, source, destination, onSourceChange, onDestinationChange, onSourceCoords, onDestCoords, onSearch],
   );
 
   const handleSwap = useCallback(() => {
+    if (onSwap) {
+      onSwap();
+      return;
+    }
     const tmpSrc = source;
     const tmpDst = destination;
     onSourceChange(tmpDst);
     onDestinationChange(tmpSrc);
     onSourceCoords?.(null, null);
     onDestCoords?.(null, null);
-  }, [source, destination, onSourceChange, onDestinationChange, onSourceCoords, onDestCoords]);
+  }, [source, destination, onSwap, onSourceChange, onDestinationChange, onSourceCoords, onDestCoords]);
+
+  const handleKeyDown = useCallback(
+    (e: KeyboardEvent<HTMLInputElement>) => {
+      if (e.key === "Escape") {
+        setSuggestions([]);
+        setFocusedField(null);
+      }
+      if (e.key !== "Enter" || !source || !destination) return;
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      setSuggestions([]);
+      setFocusedField(null);
+      e.currentTarget.blur();
+      onSearch();
+    },
+    [source, destination, onSearch],
+  );
 
   const showLocationOption = focusedField === "source" && !source && onUseMyLocation;
   const hasDropdown =
@@ -150,7 +182,7 @@ export function SearchBar({
                 onBlur={() => setTimeout(() => {
                   if (!containerRef.current?.contains(document.activeElement)) setFocusedField(null);
                 }, 80)}
-                onKeyDown={(e) => { if (e.key === "Enter" && source && destination) onSearch(); }}
+                onKeyDown={handleKeyDown}
                 className="flex-1 text-sm text-white placeholder-white/40 outline-none bg-transparent tracking-wide"
               />
               {source && (
@@ -176,13 +208,13 @@ export function SearchBar({
                 onBlur={() => setTimeout(() => {
                   if (!containerRef.current?.contains(document.activeElement)) setFocusedField(null);
                 }, 80)}
-                onKeyDown={(e) => { if (e.key === "Enter" && source && destination) onSearch(); }}
+                onKeyDown={handleKeyDown}
                 className="flex-1 text-sm text-white placeholder-white/40 outline-none bg-transparent tracking-wide"
               />
               {source && destination && (
                 <button
                   type="button"
-                  onClick={onSearch}
+                  onClick={() => onSearch()}
                   className="text-cyan-400 hover:text-cyan-300 cursor-pointer transition-colors"
                 >
                   <Search size={16} />

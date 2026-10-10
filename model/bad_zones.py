@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from bisect import bisect_left
+
 import numpy as np
 from model.utils import haversine, detect_edge_zone
 from model.config import BAD_ZONE_THRESHOLD
@@ -23,7 +25,7 @@ def detect_bad_zones(
       warning_message
     """
     n = len(segment_signals)
-    if n == 0:
+    if n == 0 or len(path) == 0:
         return []
 
     # Compute cumulative distance along route
@@ -31,6 +33,14 @@ def detect_bad_zones(
     for i in range(1, len(path)):
         d = haversine(path[i - 1]["lat"], path[i - 1]["lng"], path[i]["lat"], path[i]["lng"])
         cum_dist.append(cum_dist[-1] + d)
+
+    # score_route subsamples long paths (path[::step]), so signal sample i is
+    # generally NOT path[i]. Map every sample to its position on the full path.
+    if n == len(path):
+        sample_idx = list(range(n))
+    else:
+        sample_idx = [round(i * (len(path) - 1) / max(n - 1, 1)) for i in range(n)]
+    sample_km = [cum_dist[j] for j in sample_idx]
 
     zones = []
     i = 0
@@ -41,10 +51,14 @@ def detect_bad_zones(
                 i += 1
             end = i - 1  # inclusive
 
-            zone_start_km = cum_dist[start]
-            zone_end_km = cum_dist[min(end, len(cum_dist) - 1)]
+            # A weak sample represents the stretch halfway to its neighbours,
+            # so even a single weak sample yields a zone of realistic length.
+            zone_start_km = (sample_km[start - 1] + sample_km[start]) / 2 if start > 0 else sample_km[start]
+            zone_end_km = (sample_km[end] + sample_km[end + 1]) / 2 if end < n - 1 else sample_km[end]
             zone_len = zone_end_km - zone_start_km
             dist_to_zone = zone_start_km
+            start_pt = min(bisect_left(cum_dist, zone_start_km), len(path) - 1)
+            end_pt = min(bisect_left(cum_dist, zone_end_km), len(path) - 1)
 
             speed_kpm = max(avg_speed_kmh / 60.0, 0.1)  # km per minute
             time_to = dist_to_zone / speed_kpm
@@ -53,7 +67,7 @@ def detect_bad_zones(
             min_sig = min(segment_signals[start:end + 1])
 
             # Check if the zone overlaps a known edge zone
-            mid_idx = (start + end) // 2
+            mid_idx = (start_pt + end_pt) // 2
             _, _, edge_name, _ = detect_edge_zone(path[mid_idx]["lat"], path[mid_idx]["lng"])
 
             if edge_name:
@@ -69,10 +83,10 @@ def detect_bad_zones(
             )
 
             zones.append({
-                "start_index": start,
-                "end_index": end,
-                "start_coord": path[start],
-                "end_coord": path[min(end, len(path) - 1)],
+                "start_index": start_pt,
+                "end_index": end_pt,
+                "start_coord": path[start_pt],
+                "end_coord": path[end_pt],
                 "length_km": round(zone_len, 2),
                 "min_signal": round(min_sig, 1),
                 "avg_signal": round(float(np.mean(segment_signals[start:end + 1])), 1),

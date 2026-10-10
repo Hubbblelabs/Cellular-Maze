@@ -1,0 +1,12 @@
+**/venv
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/node_modules
+frontend/.next
+.git
+.claude
+*.png
+*.md
+!backend/README.md
+.env

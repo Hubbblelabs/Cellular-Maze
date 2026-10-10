@@ -84,7 +84,7 @@ function distToPolylineM(
     const dx = bx - ax;
     const dy = by - ay;
     const lenSq = dx * dx + dy * dy;
-    let t = lenSq === 0 ? 0 : Math.max(0, Math.min(1, ((-ax) * dx + (-ay) * dy) / lenSq));
+    const t = lenSq === 0 ? 0 : Math.max(0, Math.min(1, ((-ax) * dx + (-ay) * dy) / lenSq));
     const projX = ax + t * dx;
     const projY = ay + t * dy;
     const d = Math.sqrt(projX * projX + projY * projY);
@@ -237,7 +237,6 @@ export default function MapView({
       map.setTerrain({ source: "mapbox-dem", exaggeration: 2.0 });
 
       // ---- Realistic sky layer ----
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       map.addLayer({
         id: "sky",
         type: "sky",
@@ -248,6 +247,7 @@ export default function MapView({
           "sky-atmosphere-color": "rgba(85, 151, 210, 0.75)",
           "sky-atmosphere-halo-color": "rgba(245, 214, 123, 0.5)",
         },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- sky paint props missing from mapbox-gl types
       } as any);
 
       // ---- 3D building extrusion -- warm glass look on satellite ----
@@ -481,14 +481,17 @@ export default function MapView({
       const startPt = selected.path[0];
       const endPt = selected.path[selected.path.length - 1];
 
-      const srcPin = new mapboxgl.Marker({ color: "#3b82f6", draggable: false })
+      // Pins are draggable: dropping one re-runs the search from the new point
+      const srcPin = new mapboxgl.Marker({ color: "#3b82f6", draggable: !!onPinDrag })
         .setLngLat([startPt.lng, startPt.lat])
         .addTo(map);
+      srcPin.on("dragend", () => handlePinDragEnd("source", srcPin));
       pinMarkersRef.current.push(srcPin);
 
-      const dstPin = new mapboxgl.Marker({ color: "#ef4444", draggable: false })
+      const dstPin = new mapboxgl.Marker({ color: "#ef4444", draggable: !!onPinDrag })
         .setLngLat([endPt.lng, endPt.lat])
         .addTo(map);
+      dstPin.on("dragend", () => handlePinDragEnd("destination", dstPin));
       pinMarkersRef.current.push(dstPin);
 
       // Fit bounds -- preserve 3D pitch and add tilt offset so the route
@@ -501,7 +504,7 @@ export default function MapView({
         linear: false,
       });
     }
-  }, [mapLoaded, routes, selectedRouteIndex, onRouteClick, handlePinDragEnd]);
+  }, [mapLoaded, routes, selectedRouteIndex, onRouteClick, onPinDrag, handlePinDragEnd]);
 
   // -----------------------------------------------------------------------
   // 2b. Dead zone overlays -- drawn as thick warning segments ON the route
@@ -992,8 +995,21 @@ export default function MapView({
       trackingMarkerRef.current = new mapboxgl.Marker({ element: el })
         .setLngLat([trackingPosition.lng, trackingPosition.lat])
         .addTo(mapRef.current);
+      // Zoom in on the vehicle when navigation starts
+      mapRef.current.easeTo({
+        center: [trackingPosition.lng, trackingPosition.lat],
+        zoom: 15,
+        pitch: 55,
+        duration: 1000,
+      });
     } else {
       trackingMarkerRef.current.setLngLat([trackingPosition.lng, trackingPosition.lat]);
+      // Follow the vehicle without fighting user zoom/rotation
+      mapRef.current.easeTo({
+        center: [trackingPosition.lng, trackingPosition.lat],
+        duration: 450,
+        easing: (t) => t,
+      });
     }
   }, [mapLoaded, trackingPosition]);
 

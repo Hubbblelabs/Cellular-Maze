@@ -9,15 +9,13 @@ type Props = {
 };
 
 export function Toast({ message, type = "info" }: Props) {
-  const [dismissed, setDismissed] = useState(false);
-
-  useEffect(() => {
-    setDismissed(false);
-  }, [message]);
+  // Remember which message was dismissed, so a new message shows again
+  const [dismissedMessage, setDismissedMessage] = useState<string | null>(null);
+  const dismissed = message !== null && message === dismissedMessage;
 
   useEffect(() => {
     if (!message || dismissed) return;
-    const timer = setTimeout(() => setDismissed(true), 8000);
+    const timer = setTimeout(() => setDismissedMessage(message), 8000);
     return () => clearTimeout(timer);
   }, [message, dismissed]);
 
@@ -39,7 +37,8 @@ export function Toast({ message, type = "info" }: Props) {
       <p className="text-sm flex-1">{message}</p>
       <button
         type="button"
-        onClick={() => setDismissed(true)}
+        onClick={() => setDismissedMessage(message)}
+        aria-label="Dismiss notification"
         className="shrink-0 text-white/30 hover:text-white/70 cursor-pointer transition-colors"
       >
         <X size={14} />

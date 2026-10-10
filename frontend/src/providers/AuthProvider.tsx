@@ -1,12 +1,6 @@
 "use client";
 
-import React, {
-  createContext,
-  useContext,
-  useState,
-  useEffect,
-  ReactNode,
-} from "react";
+import React, { createContext, useCallback, useContext, useSyncExternalStore, ReactNode } from "react";
 
 interface AuthContextType {
   token: string | null;
@@ -18,36 +12,44 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
-export const AuthProvider = ({ children }: { children: ReactNode }) => {
-  const [token, setToken] = useState<string | null>(null);
-  const [hydrated, setHydrated] = useState(false);
+const TOKEN_KEY = "token";
+const TOKEN_EVENT = "cellularmaze-auth-token";
 
-  useEffect(() => {
-    const storedToken = localStorage.getItem("token");
-    if (storedToken) {
-      setToken(storedToken);
+// The token lives in localStorage; subscribe to same-tab changes (custom
+// event) and other tabs (storage event) so every consumer stays in sync.
+function subscribe(onChange: () => void) {
+  window.addEventListener("storage", onChange);
+  window.addEventListener(TOKEN_EVENT, onChange);
+  return () => {
+    window.removeEventListener("storage", onChange);
+    window.removeEventListener(TOKEN_EVENT, onChange);
+  };
+}
+
+const readToken = () => localStorage.getItem(TOKEN_KEY);
+const noSubscribe = () => () => {};
+
+export const AuthProvider = ({ children }: { children: ReactNode }) => {
+  // Server render has no localStorage: token is null and hydrated is false
+  const token = useSyncExternalStore(subscribe, readToken, () => null);
+  const hydrated = useSyncExternalStore(noSubscribe, () => true, () => false);
+
+  const setToken = useCallback((newToken: string | null) => {
+    if (newToken) {
+      localStorage.setItem(TOKEN_KEY, newToken);
+    } else {
+      localStorage.removeItem(TOKEN_KEY);
     }
-    setHydrated(true);
+    window.dispatchEvent(new Event(TOKEN_EVENT));
   }, []);
 
-  const handleSetToken = (newToken: string | null) => {
-    if (newToken) {
-      localStorage.setItem("token", newToken);
-    } else {
-      localStorage.removeItem("token");
-    }
-    setToken(newToken);
-  };
-
-  const logout = () => {
-    handleSetToken(null);
-  };
+  const logout = useCallback(() => setToken(null), [setToken]);
 
   return (
     <AuthContext.Provider
       value={{
         token,
-        setToken: handleSetToken,
+        setToken,
         logout,
         isAuthenticated: !!token,
         hydrated,

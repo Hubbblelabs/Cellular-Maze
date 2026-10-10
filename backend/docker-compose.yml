@@ -1,17 +1,18 @@
-version: "3.9"
-
+# Backend + MongoDB (MongoDB is optional; auth falls back to an in-memory store).
+# Run from this directory: docker compose up --build
 services:
   backend:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: backend/Dockerfile
     ports:
       - "8000:8000"
+    env_file:
+      - path: ../.env
+        required: false
     environment:
       - MONGO_URI=mongodb://mongo:27017
       - DB_NAME=cellularmaze
-      - MODEL_URL=http://ml-service:8001
-      - OSRM_URL=http://router.project-osrm.org
     depends_on:
       - mongo
     restart: unless-stopped

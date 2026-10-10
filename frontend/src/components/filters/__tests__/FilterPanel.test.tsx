@@ -3,7 +3,7 @@ import { FilterPanel } from "../FilterPanel";
 
 // Mock ChatBot
 jest.mock("@/src/components/chat/ChatBot", () => ({
-  ChatBot: ({ onClose }: any) => (
+  ChatBot: ({ onClose }: { onClose: () => void }) => (
     <div data-testid="chatbot">
       <button onClick={onClose}>Close Chat</button>
     </div>
@@ -47,7 +47,7 @@ describe("FilterPanel", () => {
 
   it("deselects an ISP on second click", () => {
     render(<FilterPanel {...defaultProps} selectedIsps={["jio"]} />);
-    fireEvent.click(screen.getByText("Jio"));
+    fireEvent.click(screen.getByRole("button", { name: "Jio" }));
     expect(defaultProps.onIspsChange).toHaveBeenCalledWith([]);
   });
 
@@ -66,9 +66,7 @@ describe("FilterPanel", () => {
       />,
     );
     expect(screen.getByText("Signal")).toBeInTheDocument();
-    expect(screen.getByText("Weather")).toBeInTheDocument();
     expect(screen.getByText("Traffic")).toBeInTheDocument();
-    expect(screen.getByText("Road")).toBeInTheDocument();
   });
 
   it("calls onHeatmapFilterChange when layer clicked", () => {
@@ -80,8 +78,11 @@ describe("FilterPanel", () => {
         onHeatmapFilterChange={onHeatmapFilterChange}
       />,
     );
-    fireEvent.click(screen.getByText("Weather"));
-    expect(onHeatmapFilterChange).toHaveBeenCalledWith("weather");
+    fireEvent.click(screen.getByText("Traffic"));
+    expect(onHeatmapFilterChange).toHaveBeenCalledWith("traffic");
+    // Clicking the active layer toggles it off
+    fireEvent.click(screen.getByText("Signal"));
+    expect(onHeatmapFilterChange).toHaveBeenCalledWith("none");
   });
 
   it("opens chatbot panel on button click", () => {
@@ -91,8 +92,9 @@ describe("FilterPanel", () => {
   });
 
   it("shows detected network pill when available", () => {
-    render(<FilterPanel {...defaultProps} detectedNetwork="Airtel" />);
-    expect(screen.getByText(/Airtel/)).toBeInTheDocument();
+    render(<FilterPanel {...defaultProps} detectedNetwork="Bharti Airtel" />);
+    expect(screen.getByText("Bharti Airtel")).toBeInTheDocument();
+    expect(screen.getByText("On:")).toBeInTheDocument();
   });
 
   it("shows weather section when weather prop provided", () => {

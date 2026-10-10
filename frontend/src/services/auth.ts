@@ -1,4 +1,4 @@
-const rawApiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8001";
+const rawApiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 function normalizeAuthApiBase(url: string): string {
   const base = url.trim().replace(/\/+$/, "");
@@ -9,6 +9,22 @@ function normalizeAuthApiBase(url: string): string {
 }
 
 export const API_URL = normalizeAuthApiBase(rawApiUrl);
+
+/** FastAPI returns `detail` as a string, or as a list of validation errors. */
+async function errorMessage(response: Response, fallback: string): Promise<string> {
+  try {
+    const data = await response.json();
+    if (typeof data.detail === "string") return data.detail;
+    if (Array.isArray(data.detail) && data.detail.length > 0) {
+      const first = data.detail[0];
+      const field = Array.isArray(first.loc) ? first.loc[first.loc.length - 1] : "";
+      return field ? `${field}: ${first.msg}` : first.msg;
+    }
+  } catch {
+    // non-JSON body
+  }
+  return fallback;
+}
 
 export const login = async (username: string, password: string) => {
   const formData = new URLSearchParams();
@@ -24,8 +40,7 @@ export const login = async (username: string, password: string) => {
   });
 
   if (!response.ok) {
-    const errorData = await response.json();
-    throw new Error(errorData.detail || "Login failed");
+    throw new Error(await errorMessage(response, "Login failed"));
   }
 
   return response.json();
@@ -45,8 +60,7 @@ export const register = async (
   });
 
   if (!response.ok) {
-    const errorData = await response.json();
-    throw new Error(errorData.detail || "Registration failed");
+    throw new Error(await errorMessage(response, "Registration failed"));
   }
 
   return response.json();
