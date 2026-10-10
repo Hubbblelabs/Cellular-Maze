@@ -106,6 +106,8 @@ export type WeatherInfo = {
   weather_factor: number;
   signal_impact: string;
   weather_id: number;
+  /** "fallback" means the weather API was unavailable and values are neutral defaults */
+  source?: "openweather" | "fallback";
 };
 
 export type CongestionAlert = {

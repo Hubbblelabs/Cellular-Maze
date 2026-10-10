@@ -57,6 +57,7 @@ from backend.routing.tomtom_client import TomTomClient
 from backend.routing.geocode import geocode_query, reverse_geocode_query
 from backend.routing.road_routes import get_road_routes
 from backend.db.base import MongoClient
+from backend.core.logging import logger
 from backend import weather as _weather
 from backend import crowd_tracker as _crowd
 from backend import dead_zone_predictor as _dzp
@@ -145,8 +146,9 @@ async def _startup_tomtom():
     await _tomtom.startup()
     try:
         await MongoClient.connect()
-    except Exception:
-        pass  # MongoDB is optional; auth won't work without it
+    except Exception as exc:
+        # MongoDB is optional: accounts then live in memory until restart
+        logger.warning("MongoDB unavailable, using in-memory user store: %s", type(exc).__name__)
 
 
 @app.on_event("shutdown")
@@ -409,6 +411,29 @@ def _via_candidates(
     return [(name, c) for _, name, c in scored[:limit]]
 
 
+def _name_by_via_zone(routes: list[dict]) -> None:
+    """Name routes after the area that sets each apart ("Via Koramangala").
+
+    Position-based names like "Best Signal Route" were assigned before any
+    scoring and could contradict the actual ranking.
+    """
+    if not routes:
+        return
+    counts: dict[str, int] = {}
+    for r in routes:
+        for z in set(r.get("zones", [])[1:-1]):  # skip origin/destination areas
+            counts[z] = counts.get(z, 0) + 1
+    used_zones: set[str] = set()
+    for i, r in enumerate(routes):
+        inner = [z for z in r.get("zones", [])[1:-1] if z not in used_zones]
+        if inner and len(routes) > 1:
+            zone = min(inner, key=lambda z: counts[z])  # rarest = most distinctive
+            used_zones.add(zone)
+            r["name"] = f"Via {zone}"
+        else:
+            r["name"] = "Direct Route" if i == 0 else f"Alternative {i}"
+
+
 async def _fetch_base_routes(
     src: tuple[float, float], dst: tuple[float, float],
 ) -> list[dict]:
@@ -441,6 +466,7 @@ async def _fetch_base_routes(
                     "traffic_delay": tt.get("traffic_delay", 0),
                     "source": "tomtom",
                 })
+            _name_by_via_zone(routes)
             return routes
 
     road = await get_road_routes(src, dst, _via_candidates(src, dst), max_routes=_MAX_ROUTES)
@@ -595,6 +621,16 @@ def _route_cache_put(key: str, response: dict) -> None:
     _route_cache[key] = (now, response)
 
 
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro) -> None:
+    """Fire-and-forget a coroutine, keeping a reference so it isn't GC'd."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 # -----------------------------------------------------------------------
 # GET /api/routes/fast  --  instant route geometry (no ML scoring)
 # -----------------------------------------------------------------------
@@ -734,8 +770,9 @@ async def api_routes(
         include_multi_sim=include_multi_sim,
     )
 
-    # Seed crowd tracker with real TomTom flow data (async)
-    await _crowd.seed_from_routes(ranked, now_hour)
+    # Seed crowd tracker with live TomTom flow in the background; alerts use
+    # it during navigation, so it must not hold up the route response.
+    _spawn_background(_crowd.seed_from_routes(ranked, now_hour))
 
     # Multi-carrier dead zone prediction for each route — run in parallel
     loop = asyncio.get_event_loop()
@@ -953,11 +990,10 @@ async def api_heatmap(layer: str = Query("signal")):
             })
 
     elif layer == "traffic":
-        # Derive traffic congestion from zone density + time-of-day variation
+        # Live TomTom flow at each zone centre (cached 5 min per ~500 m cell);
+        # zones TomTom can't answer fall back to a density x time-of-day estimate.
         import math
         hour = datetime.datetime.now().hour
-        # Peak hours: 8-10 AM, 5-8 PM
-        peak_factor = 1.0
         if 8 <= hour <= 10:
             peak_factor = 1.6 + 0.2 * math.sin(hour * 0.5)
         elif 17 <= hour <= 20:
@@ -966,18 +1002,29 @@ async def api_heatmap(layer: str = Query("signal")):
             peak_factor = 1.1
         else:
             peak_factor = 0.6
-
         density_map = {"high": 80, "medium": 50, "low": 25}
         terrain_traffic = {"highway": 15, "urban_main": 20, "suburban": -5, "residential": -15}
 
-        for name, info in ZONES.items():
+        sem = asyncio.Semaphore(6)
+
+        async def _zone_flow(lat: float, lng: float):
+            async with sem:
+                return await _crowd.get_flow(lat, lng)
+
+        names = list(ZONES)
+        flows = await asyncio.gather(*(_zone_flow(*ZONES[n]["center"]) for n in names))
+
+        for name, flow in zip(names, flows):
+            info = ZONES[name]
             lat, lng = info["center"]
-            base = density_map.get(info.get("density", "medium"), 50)
-            terrain_adj = terrain_traffic.get(info.get("terrain", "urban_main"), 0)
-            # Seeded jitter so each zone has consistent but varied congestion
-            jitter = (hash(name) % 21) - 10
-            raw = (base + terrain_adj + jitter) * peak_factor
-            score = round(max(5, min(100, raw)), 1)
+            if flow:
+                score = round(max(5.0, min(100.0, flow["congestion_ratio"] * 100)), 1)
+                source = "tomtom"
+            else:
+                base = density_map.get(info.get("density", "medium"), 50)
+                terrain_adj = terrain_traffic.get(info.get("terrain", "urban_main"), 0)
+                score = round(max(5, min(100, (base + terrain_adj) * peak_factor)), 1)
+                source = "estimate"
             if score >= 70:
                 label, color = "Heavy", "#ef4444"
             elif score >= 40:
@@ -988,6 +1035,7 @@ async def api_heatmap(layer: str = Query("signal")):
                 "name": name, "lat": lat, "lng": lng,
                 "score": score, "label": label, "color": color,
                 "radius_km": info["radius_km"],
+                "source": source,
             })
 
     elif layer == "road":

@@ -11,6 +11,8 @@ import os
 import time
 import httpx
 
+from backend.core.logging import logger
+
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 _BASE_URL = "https://api.openweathermap.org/data/2.5/weather"
 _CACHE_TTL = 600  # 10 minutes
@@ -93,6 +95,7 @@ def _parse(data: dict) -> dict:
         "weather_factor": factor,
         "signal_impact": impact,
         "weather_id": weather_id,
+        "source": "openweather",
     }
 
 
@@ -107,7 +110,9 @@ _FALLBACK = {
     "weather_factor": 1.0,
     "signal_impact": "No impact on signal",
     "weather_id": 800,
+    "source": "fallback",
 }
+_FALLBACK_TTL = 60  # retry a failing API at most once a minute per location
 
 
 async def get_weather(lat: float, lng: float) -> dict:
@@ -123,19 +128,22 @@ async def get_weather(lat: float, lng: float) -> dict:
     if cached is not None and now - ts < _CACHE_TTL:
         return cached
 
-    try:
-        url = (
-            f"{_BASE_URL}"
-            f"?lat={lat}&lon={lng}"
-            f"&appid={OPENWEATHER_API_KEY}&units=metric"
-        )
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(url)
+    if OPENWEATHER_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(
+                    _BASE_URL,
+                    params={"lat": lat, "lon": lng, "appid": OPENWEATHER_API_KEY, "units": "metric"},
+                )
             if resp.status_code == 200:
                 result = _parse(resp.json())
                 _cache[key] = (now, result)
                 return result
-    except Exception:
-        pass
+            # Never log the URL: it carries the API key
+            logger.warning("OpenWeather returned HTTP %s; using neutral weather", resp.status_code)
+        except Exception as exc:
+            logger.warning("OpenWeather request failed (%s); using neutral weather", type(exc).__name__)
 
+    # Cache the fallback briefly so a bad key doesn't cost a request per call
+    _cache[key] = (now - _CACHE_TTL + _FALLBACK_TTL, dict(_FALLBACK))
     return dict(_FALLBACK)

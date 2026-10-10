@@ -59,7 +59,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         duration_ms = (time.time() - start) * 1000
         logger.info(
             f"[{request_id}] {request.method} {request.url.path} "
-            f"→ {response.status_code} ({duration_ms:.1f}ms)"
+            f"-> {response.status_code} ({duration_ms:.1f}ms)"
         )
 
         response.headers["X-Response-Time"] = f"{duration_ms:.1f}ms"

@@ -23,6 +23,7 @@ Edge-case handling:
   - Stale observations (> STALE_EVICT_MINUTES with no update) are evicted
   - On-route alerts persisting > 8 min trigger a reroute suggestion
 """
+import asyncio
 import math
 import os
 import time
@@ -53,7 +54,7 @@ ON_PATH_RADIUS_KM: float = 0.40   # 400 m
 HIGH_CONGESTION: float = 0.65
 HIGH_CROWD: float = 0.65
 MIN_SAMPLES: int = 2
-_FLOW_CACHE_TTL: int = 90          # seconds — TomTom flow data freshness
+_FLOW_CACHE_TTL: int = 300         # seconds; also bounds TomTom quota use
 
 _DENSITY_SCORE = {"high": 0.85, "medium": 0.55, "low": 0.25}
 
@@ -317,54 +318,63 @@ def record_congestion(
 # -----------------------------------------------------------------------
 # Seeding from routes  (async — queries TomTom flow per sampled point)
 # -----------------------------------------------------------------------
+_SEED_MAX_POINTS = 30       # TomTom free tier is ~2,500 requests/day
+_SEED_CONCURRENCY = 6
+
+
 async def seed_from_routes(route_dicts: list[dict], hour: float) -> None:
     """Seed the tracker with real TomTom flow data for route path points.
 
-    Samples up to 20 points per route.  For each point, fetches live
-    traffic flow from TomTom; falls back to time-based simulation if
-    the API call fails.
+    Points are de-duplicated on the ~500 m flow grid across all routes
+    (alternatives overlap heavily), capped, and fetched concurrently.
+    Falls back to time-based simulation where the API call fails.
     """
+    points: dict[str, tuple[float, float, float | None]] = {}
     for route in route_dicts:
         path = route.get("path", [])
         if not path:
             continue
-        conn = route.get("connectivity", {})
-        segs = conn.get("segment_signals", [])
-        total = len(path)
-        step = max(1, total // 20)
+        segs = route.get("connectivity", {}).get("segment_signals", [])
+        step = max(1, len(path) // 12)
+        for i in range(0, len(path), step):
+            lat, lng = path[i]["lat"], path[i]["lng"]
+            sig = segs[min(i * len(segs) // len(path), len(segs) - 1)] / 100.0 if segs else None
+            points.setdefault(_grid_key(lat, lng), (lat, lng, sig))
 
-        for i in range(0, total, step):
-            pt = path[i]
-            lat, lng = pt["lat"], pt["lng"]
+    sampled = list(points.values())
+    if len(sampled) > _SEED_MAX_POINTS:
+        stride = len(sampled) / _SEED_MAX_POINTS
+        sampled = [sampled[int(i * stride)] for i in range(_SEED_MAX_POINTS)]
 
+    sem = asyncio.Semaphore(_SEED_CONCURRENCY)
+
+    async def _seed_point(lat: float, lng: float, sig: float | None) -> None:
+        async with sem:
             flow = await get_flow(lat, lng)
 
-            if flow:
-                congestion = flow["congestion_ratio"]
-                # crowd is a blend of congestion + time-of-day (pedestrian density)
-                crowd = min(congestion * 0.7 + _fallback_crowd(lat, lng, hour) * 0.3, 1.0)
-                source = "tomtom"
-                current_spd = flow["current_speed_kmh"]
-                free_flow_spd = flow["free_flow_speed_kmh"]
-                confidence = flow["confidence"]
-            else:
-                # Fallback: derive from model signal + time simulation
-                if segs:
-                    sig = segs[min(i, len(segs) - 1)] / 100.0
-                    crowd = _fallback_crowd(lat, lng, hour)
-                    congestion = max(0.0, (1.0 - sig) * crowd)
-                else:
-                    crowd = _fallback_crowd(lat, lng, hour)
-                    congestion = crowd * 0.30
-                source = "fallback"
-                current_spd = free_flow_spd = confidence = 0.0
+        if flow:
+            congestion = flow["congestion_ratio"]
+            # crowd is a blend of congestion + time-of-day (pedestrian density)
+            crowd = min(congestion * 0.7 + _fallback_crowd(lat, lng, hour) * 0.3, 1.0)
+            source = "tomtom"
+            current_spd = flow["current_speed_kmh"]
+            free_flow_spd = flow["free_flow_speed_kmh"]
+            confidence = flow["confidence"]
+        else:
+            # Fallback: derive from model signal + time simulation
+            crowd = _fallback_crowd(lat, lng, hour)
+            congestion = max(0.0, (1.0 - sig) * crowd) if sig is not None else crowd * 0.30
+            source = "fallback"
+            current_spd = free_flow_spd = confidence = 0.0
 
-            if crowd > 0.40 or congestion > 0.35:
-                zone_name, _ = _nearest_zone(lat, lng)
-                record_congestion(
-                    lat, lng, congestion, crowd, zone_name, source,
-                    current_spd, free_flow_spd, confidence,
-                )
+        if crowd > 0.40 or congestion > 0.35:
+            zone_name, _ = _nearest_zone(lat, lng)
+            record_congestion(
+                lat, lng, congestion, crowd, zone_name, source,
+                current_spd, free_flow_spd, confidence,
+            )
+
+    await asyncio.gather(*(_seed_point(*pt) for pt in sampled))
 
 
 # -----------------------------------------------------------------------

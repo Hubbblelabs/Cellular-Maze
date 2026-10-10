@@ -1,6 +1,7 @@
 """Model inference: load trained weights and expose predict / predict_single."""
 
 import sys
+import threading
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -16,6 +17,7 @@ from model.architecture import SignalNet
 
 _model: SignalNet | None = None
 _device: torch.device | None = None
+_load_lock = threading.Lock()  # routes are scored in parallel threads
 
 
 def _load_model():
@@ -23,22 +25,30 @@ def _load_model():
     global _model, _device
     if _model is not None:
         return
+    with _load_lock:
+        if _model is None:
+            _load_model_locked()
 
-    _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    _model = SignalNet(input_dim=INPUT_DIM).to(_device)
+
+def _load_model_locked():
+    global _model, _device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = SignalNet(input_dim=INPUT_DIM).to(device)
 
     if WEIGHTS_PATH.exists():
         try:
-            ckpt = torch.load(WEIGHTS_PATH, map_location=_device, weights_only=True)
-            _model.load_state_dict(ckpt["model_state_dict"])
-            _model.eval()
-            print(f"[inference] Loaded model from {WEIGHTS_PATH} on {_device}")
+            ckpt = torch.load(WEIGHTS_PATH, map_location=device, weights_only=True)
+            model.load_state_dict(ckpt["model_state_dict"])
+            print(f"[inference] Loaded model from {WEIGHTS_PATH} on {device}")
         except RuntimeError as e:
-            _model.eval()
             print(f"[inference] WARNING: Weights incompatible (likely INPUT_DIM changed) -- using random init. Re-train to fix. Error: {e}")
     else:
-        _model.eval()
         print(f"[inference] WARNING: No weights at {WEIGHTS_PATH} -- using random init")
+    model.eval()
+
+    # Publish only once fully loaded so other threads never see random weights
+    _device = device
+    _model = model
 
 
 def predict(features: np.ndarray) -> dict:

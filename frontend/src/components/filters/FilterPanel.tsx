@@ -206,7 +206,7 @@ export function FilterPanel({
           )}
 
           {/* Weather section */}
-          {weather && (
+          {weather && weather.source !== "fallback" && (
             <div className="px-3 pb-3 border-t border-white/[0.06] pt-3">
               <p className="text-[10px] font-semibold uppercase tracking-wider text-white/35 mb-2">Weather</p>
               <WeatherBadge weather={weather} />

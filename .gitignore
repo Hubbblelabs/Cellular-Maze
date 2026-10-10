@@ -26,3 +26,7 @@ frontend/out/
 # Build artifacts
 dist/
 build/
+
+# Runtime caches
+model/data/opencellid_tile_cache.json
+model/data/*.tmp

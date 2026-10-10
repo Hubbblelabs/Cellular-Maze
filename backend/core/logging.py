@@ -9,6 +9,9 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
     if logger.handlers:
         return logger
 
+    # Windows consoles default to cp1252; don't let a non-ASCII log line raise
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
     handler = logging.StreamHandler(sys.stdout)
     formatter = logging.Formatter(
         fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",

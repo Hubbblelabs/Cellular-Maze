@@ -11,9 +11,13 @@ MNC -> Operator mapping (Karnataka circle):
     BSNL:   51, 53, 57, 58, 59, 71, 72, 73, 74, 75, 76
 """
 
+import logging
 import time
 import math
 import os
+import threading
+import json
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 import requests
 import pandas as pd
 import numpy as np
@@ -108,6 +112,10 @@ def _tiles_for_zone(center: tuple[float, float], radius_km: float) -> list[tuple
     return tiles
 
 
+class QuotaExceeded(Exception):
+    """OpenCelliD daily request limit reached for this API key."""
+
+
 def fetch_cells_in_bbox(
     bbox: tuple[float, float, float, float],
     radio: str = "",
@@ -125,13 +133,18 @@ def fetch_cells_in_bbox(
 
     try:
         resp = requests.get(f"{BASE_URL}/cell/getInArea", params=params, timeout=10)
+        if resp.status_code == 429 or '"code":7' in resp.text[:100]:
+            raise QuotaExceeded(resp.text[:120])
         if resp.status_code == 200:
             data = resp.json()
             if "cells" in data:
                 return data["cells"]
         return []
+    except QuotaExceeded:
+        raise
     except Exception as e:
-        print(f"  [warn] API error for bbox {bbox}: {e}")
+        # Never log the request URL: it carries the API key
+        print(f"  [warn] OpenCelliD error for bbox {bbox}: {type(e).__name__}")
         return []
 
 
@@ -340,6 +353,119 @@ def refresh_towers(max_per_zone: int = 50) -> pd.DataFrame:
     return df
 
 
+# ---------------------------------------------------------------------------
+# Live tower lookup along a route
+# ---------------------------------------------------------------------------
+# Routes are snapped to a fixed grid of ~1.5 km tiles. Neighbouring routes
+# (and repeat searches) share tiles, so each tile costs at most one API
+# request per day. OpenCelliD's free tier is only ~5,000 requests/day.
+_TILE_DEG = 0.014                 # ~1.5 km; well under the 4 km^2 bbox limit
+_TILE_TTL_S = 7 * 24 * 3600       # towers rarely move; tiles persist across restarts
+_FAILED_TILE_TTL_S = 300          # retry a failed tile after 5 minutes
+_MAX_TILES_PER_ROUTE = 20
+_FETCH_BUDGET_S = 8.0             # never hold up routing longer than this
+_TILE_CACHE_FILE = DATA_DIR / "opencellid_tile_cache.json"
+
+_tile_cache: dict[tuple[int, int], tuple[float, list[dict]]] = {}
+_inflight: dict[tuple[int, int], Future] = {}
+_tile_lock = threading.Lock()
+# One small shared pool: alternatives overlap, and the free tier is ~5,000 req/day
+_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="opencellid")
+_quota_blocked_until = 0.0
+_log = logging.getLogger("cellularmaze")
+
+
+def _load_tile_cache() -> None:
+    try:
+        raw = json.loads(_TILE_CACHE_FILE.read_text(encoding="utf-8"))
+        now = time.time()
+        for key, (expires, cells) in raw.items():
+            if expires > now:
+                lat_i, lng_i = map(int, key.split(","))
+                _tile_cache[(lat_i, lng_i)] = (expires, cells)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        _log.warning("Ignoring unreadable OpenCelliD tile cache: %s", type(exc).__name__)
+
+
+def _save_tile_cache() -> None:
+    with _tile_lock:
+        data = {f"{t[0]},{t[1]}": v for t, v in _tile_cache.items() if v[1]}
+    try:
+        tmp = _TILE_CACHE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        tmp.replace(_TILE_CACHE_FILE)
+    except OSError as exc:
+        _log.warning("Could not save OpenCelliD tile cache: %s", type(exc).__name__)
+
+
+_load_tile_cache()
+
+
+def _seconds_until_utc_midnight() -> float:
+    return 86400 - (time.time() % 86400)
+
+
+def _tiles_along(path: list[dict]) -> list[tuple[int, int]]:
+    """Unique grid tiles a path passes through, in travel order, capped."""
+    tiles: list[tuple[int, int]] = []
+    seen: set = set()
+    for pt in path:
+        t = (math.floor(pt["lat"] / _TILE_DEG), math.floor(pt["lng"] / _TILE_DEG))
+        if t not in seen:
+            seen.add(t)
+            tiles.append(t)
+    if len(tiles) > _MAX_TILES_PER_ROUTE:
+        step = len(tiles) / _MAX_TILES_PER_ROUTE
+        tiles = [tiles[int(i * step)] for i in range(_MAX_TILES_PER_ROUTE)]
+    return tiles
+
+
+def _cached_tile(tile: tuple[int, int], now: float) -> list[dict] | None:
+    with _tile_lock:
+        entry = _tile_cache.get(tile)
+    if entry is None:
+        return None
+    expires, cells = entry
+    return cells if now < expires else None
+
+
+def _fetch_tile(tile: tuple[int, int]) -> list[dict]:
+    global _quota_blocked_until
+    try:
+        if time.time() < _quota_blocked_until:
+            return []
+        lat0, lng0 = tile[0] * _TILE_DEG, tile[1] * _TILE_DEG
+        bbox = (round(lat0, 6), round(lng0, 6), round(lat0 + _TILE_DEG, 6), round(lng0 + _TILE_DEG, 6))
+        try:
+            cells = fetch_cells_in_bbox(bbox, limit=50)
+        except QuotaExceeded:
+            if time.time() >= _quota_blocked_until:
+                _quota_blocked_until = time.time() + _seconds_until_utc_midnight()
+                _log.warning("OpenCelliD daily limit reached; using bundled tower data until UTC midnight")
+            return []
+        ttl = _TILE_TTL_S if cells else _FAILED_TILE_TTL_S
+        with _tile_lock:
+            _tile_cache[tile] = (time.time() + ttl, cells)
+        if cells:
+            _save_tile_cache()
+        return cells
+    finally:
+        with _tile_lock:
+            _inflight.pop(tile, None)
+
+
+def _submit_tile(tile: tuple[int, int]) -> Future:
+    """Start fetching a tile, or join a fetch already in flight for it."""
+    with _tile_lock:
+        fut = _inflight.get(tile)
+        if fut is None:
+            fut = _pool.submit(_fetch_tile, tile)
+            _inflight[tile] = fut
+        return fut
+
+
 def fetch_towers_for_path(
     path: list[dict],
     sample_every_n: int = 30,
@@ -348,42 +474,39 @@ def fetch_towers_for_path(
 ) -> pd.DataFrame:
     """Fetch real cell towers near a route from OpenCelliD in real time.
 
-    Samples every ``sample_every_n`` points along the path, queries a small
-    bounding box around each sample, de-duplicates, and returns a DataFrame
-    with the same schema as ``get_towers()``.
-
-    Parameters
-    ----------
-    path : list of {"lat": float, "lng": float} from TomTom / synthetic
-    sample_every_n : query every Nth point (reduces API calls)
-    max_towers : cap total towers returned
-    radius_km : query radius around each sample point
+    Queries the grid tiles the route passes through (cached for 24 h and
+    shared between routes), in parallel, within a fixed time budget.
+    Returns a DataFrame with the same schema as ``get_towers()``.
+    ``sample_every_n`` and ``radius_km`` are kept for API compatibility.
     """
-    if not _api_key():
+    if not _api_key() or not path:
         return pd.DataFrame()
+
+    started = time.time()
+    tiles = _tiles_along(path)
+    cells_by_tile: dict[tuple[int, int], list[dict]] = {}
+    missing = []
+    for t in tiles:
+        cached = _cached_tile(t, started)
+        if cached is None:
+            missing.append(t)
+        else:
+            cells_by_tile[t] = cached
+
+    if missing and time.time() >= _quota_blocked_until:
+        futures = {_submit_tile(t): t for t in missing}
+        try:
+            for fut in as_completed(futures, timeout=_FETCH_BUDGET_S):
+                cells_by_tile[futures[fut]] = fut.result()
+        except FuturesTimeout:
+            # Unfinished requests keep running and still fill the cache
+            _log.warning("OpenCelliD: %d tile(s) still pending after %.0fs, continuing without them",
+                         sum(1 for f in futures if not f.done()), _FETCH_BUDGET_S)
 
     seen_ids: set = set()
     towers: list[dict] = []
-
-    # Deduplicate sample points by snapping to a grid
-    sampled = path[::max(1, sample_every_n)]
-    if path and path[-1] not in sampled:
-        sampled.append(path[-1])
-
-    for pt in sampled:
-        if len(towers) >= max_towers:
-            break
-
-        lat, lng = pt["lat"], pt["lng"]
-        # Bounding box: radius_km in each direction
-        half = min(radius_km / 111.0, 0.012)
-        bbox = (
-            round(lat - half, 6), round(lng - half, 6),
-            round(lat + half, 6), round(lng + half, 6),
-        )
-
-        cells = fetch_cells_in_bbox(bbox, limit=50)
-        for cell in cells:
+    for t in tiles:
+        for cell in cells_by_tile.get(t, []):
             mcc = cell.get("mcc", 0)
             if mcc not in INDIA_MCC:
                 continue
@@ -398,8 +521,8 @@ def fetch_towers_for_path(
 
             towers.append({
                 "tower_id": f"OCI_{mcc}_{mnc}_{cell.get('cellid', 0)}",
-                "lat": cell.get("lat", lat),
-                "lng": cell.get("lon", lng),
+                "lat": cell.get("lat"),
+                "lng": cell.get("lon"),
                 "operator": _mnc_to_operator(mnc),
                 "signal_score": _signal_dbm_to_score(dbm, radio),
                 "frequency_mhz": _radio_to_freq(radio),
@@ -416,11 +539,12 @@ def fetch_towers_for_path(
                 "cellid": cell.get("cellid", 0),
             })
 
-        time.sleep(0.2)
-
+    _log.info("OpenCelliD: %d tiles (%d cached) -> %d towers in %.1fs%s",
+              len(tiles), len(tiles) - len(missing), len(towers), time.time() - started,
+              " [daily limit reached, using bundled towers]" if time.time() < _quota_blocked_until else "")
+    towers = [t for t in towers if t["lat"] is not None and t["lng"] is not None]
     if not towers:
         return pd.DataFrame()
-
     return pd.DataFrame(towers[:max_towers])
 
 

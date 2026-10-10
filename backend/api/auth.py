@@ -1,7 +1,7 @@
 """Authentication endpoints for Cellular Maze.
 
-Provides JWT-based auth with mock user storage for hackathon demo.
-In production, this would integrate with MongoDB via Motor.
+Users are stored in MongoDB when it is connected (MONGO_URI), otherwise in
+an in-memory dict that is lost on restart. The demo account always exists.
 """
 
 import os
@@ -13,6 +13,9 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
+
+from backend.core.logging import logger
+from backend.db.base import MongoClient
 
 router = APIRouter(prefix="/api/v1", tags=["Authentication"])
 
@@ -54,11 +57,34 @@ _users: dict[str, dict] = {
     "demo": {
         "user_id": "usr_demo",
         "username": "demo",
-        "password_hash": _pwd.hash("demo123"),
+        "hashed_password": _pwd.hash("demo123"),
         "email": "demo@cellularmaze.ai",
         "created_at": "2026-01-01T00:00:00Z",
     }
 }
+
+
+async def _find_user(username: str) -> Optional[dict]:
+    """Look a user up in MongoDB first, then the in-memory store."""
+    if MongoClient.is_connected():
+        try:
+            doc = await MongoClient.get_db()["users"].find_one({"username": username}, {"_id": 0})
+            if doc:
+                return doc
+        except Exception as exc:
+            logger.warning("User lookup in MongoDB failed: %s", type(exc).__name__)
+    return _users.get(username)
+
+
+async def _save_user(user: dict) -> None:
+    """Persist a new user to MongoDB when available, else keep it in memory."""
+    if MongoClient.is_connected():
+        try:
+            await MongoClient.get_db()["users"].insert_one(dict(user))
+            return
+        except Exception as exc:
+            logger.warning("Saving user to MongoDB failed, keeping in memory: %s", type(exc).__name__)
+    _users[user["username"]] = user
 
 
 def _create_token(data: dict) -> str:
@@ -86,8 +112,8 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
 
     Accepts application/x-www-form-urlencoded with username and password fields.
     """
-    user = _users.get(form_data.username)
-    if not user or not _pwd.verify(form_data.password, user["password_hash"]):
+    user = await _find_user(form_data.username)
+    if not user or not _pwd.verify(form_data.password, user.get("hashed_password", "")):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid username or password",
@@ -109,20 +135,20 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
 @router.post("/register", response_model=TokenResponse)
 async def register(req: UserRegister):
     """Register a new user and return JWT token."""
-    if req.username in _users:
+    if await _find_user(req.username):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Username already exists",
         )
 
     user_id = f"usr_{req.username}_{int(datetime.now(timezone.utc).timestamp())}"
-    _users[req.username] = {
+    await _save_user({
         "user_id": user_id,
         "username": req.username,
-        "password_hash": _pwd.hash(req.password),
+        "hashed_password": _pwd.hash(req.password),
         "email": req.email,
         "created_at": datetime.now(timezone.utc).isoformat(),
-    }
+    })
 
     token = _create_token({
         "sub": user_id,
@@ -150,7 +176,7 @@ async def get_me(token: str = Depends(oauth2_scheme)):
     username = payload.get("username", "")
 
     # Find user
-    user = _users.get(username)
+    user = await _find_user(username)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -161,5 +187,5 @@ async def get_me(token: str = Depends(oauth2_scheme)):
         user_id=user["user_id"],
         username=user["username"],
         email=user["email"],
-        created_at=user["created_at"],
+        created_at=str(user["created_at"]),
     )
